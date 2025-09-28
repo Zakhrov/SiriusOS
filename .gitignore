@@ -1,0 +1,44 @@
+# Build directories
+/build/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+
+# Visual Studio Code
+.vscode/
+
+# Compiled object files, libraries, executables
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.lib
+*.a
+
+# Generated files
+*.log
+*.tmp
+
+# IDE specific
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# MacOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Ninja build files
+/build.ninja
+/.ninja_deps
+/.ninja_log
+
+# Other CMake generated files
+CTestTestfile.cmake
+cmake_uninstall.cmake
+install_manifest.txt

@@ -1,0 +1,2 @@
+add_subdirectory(window_manager)
+add_subdirectory(compositor)
