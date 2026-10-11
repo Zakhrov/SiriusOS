@@ -1,9 +1,21 @@
 #include "NoirWM.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 int main(int argc, char** argv) {
-    NoirWM* wm = NoirWM_create();
+    int useCompositor = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-compositor") == 0) {
+            useCompositor = 0;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [--no-compositor]\n"
+                   "  --no-compositor  manage windows without the Vulkan compositor\n", argv[0]);
+            return EXIT_SUCCESS;
+        }
+    }
+
+    NoirWM* wm = NoirWM_create(useCompositor);
     if (!wm) {
         fprintf(stderr, "Failed to create NoirWM instance\n");
         return EXIT_FAILURE;

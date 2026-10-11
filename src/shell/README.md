@@ -94,19 +94,24 @@ notify-send -u critical "Hello" "From org.freedesktop.Notifications"
 
 ## Integration with NoirWM and the compositor
 
-The shell talks to the window manager purely through EWMH. For the full
-experience NoirWM still needs to:
+The shell talks to the window manager purely through EWMH, which NoirWM
+implements (see [the NoirWM README](../window_manager/README.md#ewmh-support)):
+the taskbar reads `_NET_CLIENT_LIST` / `_NET_ACTIVE_WINDOW` and sends
+`_NET_ACTIVE_WINDOW`, `_NET_CLOSE_WINDOW` and `WM_CHANGE_STATE`; NoirWM keeps
+the desktop at the bottom, the taskbar and popups on top, and reserves the
+taskbar's strut in `_NET_WORKAREA`.
 
-- publish `_NET_SUPPORTED`, `_NET_CLIENT_LIST` and `_NET_ACTIVE_WINDOW`, and
-  handle the `_NET_ACTIVE_WINDOW`, `_NET_CLOSE_WINDOW` and `WM_CHANGE_STATE`
-  client messages the taskbar sends;
-- keep `DESKTOP` windows at the bottom, `DOCK` windows on top, honour struts,
-  and skip its border on dock/desktop/popup/notification windows;
-- composite client windows (including the shell's ARGB surfaces) through the
-  Vulkan compositor. Until then, run the shell under any EWMH window manager
-  or in `--windowed` mode. Without a compositor, the translucent margins of
-  popups render as black.
+NoirWM's Vulkan compositor does not draw client windows yet, so for now run
+the shell with `NoirWM --no-compositor` (or under any EWMH window manager, or
+in `--windowed` mode):
 
+```bash
+# in ~/.xinitrc, or via xinit
+NoirWM --no-compositor &
+exec NoirShell
+```
+
+Without a compositor, the translucent margins of popups render as black.
 The window-level effects in the VDD (wobbly move, magic-lamp minimize,
 shattering close, 3D cube workspaces, flip carousel task switching, dialog
 expansion) belong to the compositor rather than the shell.
