@@ -2,7 +2,7 @@ project(NoirWM LANGUAGES C)
 
 set(CMAKE_C_STANDARD 17)
 include_directories(${X11_INCLUDE_DIR} include ../compositor/include)
-set(SOURCES src/main.c src/Events.c src/Client.c src/NoirWM.c)
+set(SOURCES src/main.c src/Events.c src/Client.c src/NoirWM.c src/Ewmh.c)
 
 # X11 provides Xcomposite, Xdamage, Xrender as separate components
 if(X11_Xcomposite_FOUND)
