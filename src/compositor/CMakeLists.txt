@@ -1,7 +1,7 @@
 project(NoirVulkanCompositor LANGUAGES C)
 set(CMAKE_C_STANDARD 17)
 include_directories(${X11_INCLUDE_DIR} include)
-set(SOURCES src/VulkanRenderer.c)
+set(SOURCES src/VulkanRenderer.c src/Desktop.c)
 add_library(NoirVulkanCompositor SHARED ${SOURCES})
 target_link_libraries(NoirVulkanCompositor ${X11_LIBRARIES} Vulkan::Vulkan)
 add_executable(NoirVulkanCompositorTest src/test/main.c)

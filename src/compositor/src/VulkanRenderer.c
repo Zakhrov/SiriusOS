@@ -1,4 +1,5 @@
 #include "VulkanRenderer.h"
+#include "Desktop.h"
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -591,35 +592,7 @@ void drawVulkanRendererFrame(VulkanRenderer* renderer) {
     renderPassInfo.pClearValues = &clearColor;
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkClearAttachment clearAttach = {
-    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-    .colorAttachment = 0,
-    .clearValue.color = {{0.2f, 0.2f, 0.2f, 1.0f}} // gray border
-    };
-
-    VkClearRect rect = { 0 };
-    rect.baseArrayLayer = 0;
-    rect.layerCount = 1;
-
-    // Top border (titlebar)
-    rect.rect.offset = (VkOffset2D){ 0, 0 };
-    rect.rect.extent = (VkExtent2D){ renderer->swapchainExtent.width, 40 };
-    vkCmdClearAttachments(commandBuffer, 1, &clearAttach, 1, &rect);
-
-    // Left border
-    rect.rect.offset = (VkOffset2D){ 0, 0 };
-    rect.rect.extent = (VkExtent2D){ 5, renderer->swapchainExtent.height };
-    vkCmdClearAttachments(commandBuffer, 1, &clearAttach, 1, &rect);
-
-    // Right border
-    rect.rect.offset = (VkOffset2D){ renderer->swapchainExtent.width - 5, 0 };
-    rect.rect.extent = (VkExtent2D){ 5, renderer->swapchainExtent.height };
-    vkCmdClearAttachments(commandBuffer, 1, &clearAttach, 1, &rect);
-
-    // Bottom border
-    rect.rect.offset = (VkOffset2D){ 0, renderer->swapchainExtent.height - 5 };
-    rect.rect.extent = (VkExtent2D){ renderer->swapchainExtent.width, 5 };
-    vkCmdClearAttachments(commandBuffer, 1, &clearAttach, 1, &rect);
+    recordDesktopScene(commandBuffer, renderer->swapchainExtent);
 
     vkCmdEndRenderPass(commandBuffer);
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {

@@ -9,7 +9,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    for (int i = 0; i < 100; i++) { // run 100 frames
+    for (int i = 0; i < 600; i++) { // ~10 seconds at 60Hz (FIFO)
         drawVulkanRendererFrame(renderer);
     }
 
