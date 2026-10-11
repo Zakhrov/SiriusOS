@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import Noir.Shell
 
 // Bottom-right stack of notification cards. New cards slide in from the
@@ -6,16 +7,17 @@ import Noir.Shell
 Item {
     id: stack
 
-    readonly property int contentHeight: list.contentHeight
+    readonly property int contentHeight: Math.min(list.contentHeight, Math.max(1, Screen.height - Theme.taskbarHeight - 24))
     width: 380
-    height: list.contentHeight
+    height: contentHeight
 
     ListView {
         id: list
         anchors.fill: parent
         model: NotificationServer
         spacing: 10
-        interactive: false
+        clip: true
+        interactive: contentHeight > height
         verticalLayoutDirection: ListView.BottomToTop
 
         delegate: NotificationCard {

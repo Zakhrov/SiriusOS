@@ -106,7 +106,7 @@ QtObject {
 
     property Window notificationWindow: Window {
         title: "Noir Notifications"
-        flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus | Qt.Tool
+        flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
         color: "transparent"
         width: 400
         height: Math.max(1, stack.contentHeight + 24)

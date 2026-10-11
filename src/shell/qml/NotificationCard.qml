@@ -111,7 +111,7 @@ FocusScope {
                 width: parent.width
                 visible: text.length > 0
                 text: card.body
-                textFormat: Text.StyledText
+                textFormat: Text.PlainText
                 color: Theme.silver
                 wrapMode: Text.Wrap
                 maximumLineCount: 4

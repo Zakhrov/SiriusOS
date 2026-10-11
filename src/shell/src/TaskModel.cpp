@@ -196,8 +196,12 @@ void TaskModel::refresh()
         const int existing = rowOf(id);
         Task task = existing >= 0 ? m_tasks.at(existing) : Task{};
         task.id = id;
-        if (existing < 0)
+        if (existing < 0) {
+            XcbReply<xcb_get_window_attributes_reply_t> attrs(xcb_get_window_attributes_reply(
+                c, xcb_get_window_attributes(c, id), nullptr));
+            const quint32 mask = (attrs ? attrs->your_event_mask : 0) | XCB_EVENT_MASK_PROPERTY_CHANGE;
             xcb_change_window_attributes(c, id, XCB_CW_EVENT_MASK, &mask);
+        }
         readTask(task);
         if (!task.skip)
             tasks.append(task);

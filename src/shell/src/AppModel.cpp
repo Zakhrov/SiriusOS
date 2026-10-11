@@ -124,6 +124,7 @@ bool AppModel::parseDesktopFile(const QString &path, App &app)
         else if (key == QLatin1String("Terminal")) app.terminal = value == QLatin1String("true");
         else if (key == QLatin1String("NoDisplay") || key == QLatin1String("Hidden")) hidden = hidden || value == QLatin1String("true");
         else if (key == QLatin1String("OnlyShowIn")) hidden = hidden || !value.split(QLatin1Char(';')).contains(QLatin1String("Noir"));
+        else if (key == QLatin1String("NotShowIn")) hidden = hidden || value.split(QLatin1Char(';')).contains(QLatin1String("Noir"));
     }
 
     if (!localizedName.isEmpty()) app.name = localizedName;

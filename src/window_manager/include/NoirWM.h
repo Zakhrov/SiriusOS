@@ -15,8 +15,10 @@ typedef struct {
     Window window;
     NoirLayer layer;
     int minimized;      // iconified by us: unmapped but still managed
-    int acceptsFocus;   // WM_HINTS input / WM_TAKE_FOCUS
-    int focusOnClick;   // docks and notifications never steal focus on click
+    int acceptsFocus;   // WM_HINTS input: eligible for XSetInputFocus
+    int takesFocus;     // WM_PROTOCOLS includes WM_TAKE_FOCUS
+    int focusOnClick;   // user interaction may focus the window
+    int isShellSurface; // desktop, dock, menu, or notification surface
     int isDock;
     int decorated;      // gets the silver border
     long strut[4];      // left, right, top, bottom reserved by this client

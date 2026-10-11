@@ -62,7 +62,7 @@ static void handle_client_message(NoirWM* wm, XClientMessageEvent* event) {
 
 static void handle_property_notify(NoirWM* wm, XPropertyEvent* event) {
     NoirClient* client = client_find(wm, event->window);
-    if (!client || event->state == PropertyDelete) {
+    if (!client) {
         return;
     }
     if (event->atom == noirAtoms[NET_WM_STRUT] || event->atom == noirAtoms[NET_WM_STRUT_PARTIAL]) {

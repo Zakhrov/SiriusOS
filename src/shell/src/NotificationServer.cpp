@@ -8,7 +8,6 @@
 namespace {
 NotificationServer *s_instance = nullptr;
 constexpr int DefaultTimeoutMs = 6000;
-constexpr int MaxVisible = 5;
 }
 
 NotificationServer::NotificationServer(QObject *parent)
@@ -121,8 +120,6 @@ uint NotificationServer::notify(const QString &appName, uint replacesId, const Q
         m_notifications.append(n);
         endInsertRows();
         emit countChanged();
-        if (m_notifications.size() > MaxVisible)
-            closeNotification(m_notifications.first().id, Expired);
     }
 
     // Critical notifications (urgency 2) and timeout 0 stay until dismissed.

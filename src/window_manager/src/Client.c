@@ -47,20 +47,21 @@ static void read_type(NoirWM* wm, NoirClient* client) {
     else client->layer = LAYER_NORMAL;
 
     client->decorated = !(isDesktop || isDock || isOverlay || isUndecorated);
-    client->focusOnClick = !(isDock || isOverlay);
+    client->isShellSurface = isDesktop || isDock || isOverlay;
+    client->focusOnClick = !client->isShellSurface ||
+        ewmh_has_atom(d, client->window, noirAtoms[NET_WM_WINDOW_TYPE], noirAtoms[NET_WM_WINDOW_TYPE_NOTIFICATION]);
     client->isDock = isDock;
 
-    // ICCCM: a client that sets WM_HINTS input=False and does not speak
-    // WM_TAKE_FOCUS never wants the keyboard.
+    // WM_HINTS input and WM_TAKE_FOCUS describe separate focus mechanisms.
     client->acceptsFocus = 1;
     XWMHints* hints = XGetWMHints(d, client->window);
     if (hints) {
-        if ((hints->flags & InputHint) && !hints->input &&
-            !ewmh_supports_protocol(d, client->window, noirAtoms[WM_TAKE_FOCUS])) {
+        if ((hints->flags & InputHint) && !hints->input) {
             client->acceptsFocus = 0;
         }
         XFree(hints);
     }
+    client->takesFocus = ewmh_supports_protocol(d, client->window, noirAtoms[WM_TAKE_FOCUS]);
 }
 
 static void apply_decoration(NoirWM* wm, NoirClient* client) {
@@ -208,7 +209,7 @@ void client_activate(NoirWM* wm, NoirClient* client) {
     if (client->acceptsFocus) {
         XSetInputFocus(d, client->window, RevertToPointerRoot, CurrentTime);
     }
-    if (ewmh_supports_protocol(d, client->window, noirAtoms[WM_TAKE_FOCUS])) {
+    if (client->takesFocus) {
         send_protocol(wm, client->window, noirAtoms[WM_TAKE_FOCUS]);
     }
     wm_set_active(wm, client->window);
@@ -315,7 +316,7 @@ void wm_focus_fallback(NoirWM* wm) {
     int count = stacking_order(wm, order);
     for (int i = count - 1; i >= 0; i--) {
         NoirClient* c = client_find(wm, order[i]);
-        if (c && !c->minimized && c->layer == LAYER_NORMAL && c->acceptsFocus &&
+        if (c && !c->minimized && !c->isShellSurface && (c->acceptsFocus || c->takesFocus) &&
             order[i] != wm->activeWindow) {
             free(order);
             client_activate(wm, c);
@@ -347,7 +348,7 @@ void handle_map_request(NoirWM* wm, XMapRequestEvent* event) {
     ewmh_change_state(wm->display, event->window, NET_WM_STATE_REMOVE, noirAtoms[NET_WM_STATE_HIDDEN]);
 
     // New application windows get focus; shell surfaces just take their layer.
-    if (client->layer == LAYER_NORMAL && client->acceptsFocus) {
+    if (!client->isShellSurface && (client->acceptsFocus || client->takesFocus)) {
         client_activate(wm, client);
     } else {
         wm_restack(wm);
