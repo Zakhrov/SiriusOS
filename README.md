@@ -12,3 +12,5 @@ SiriusOS is a modern, sleek, and cyberpunk-inspired operating system designed to
 
 - **Noir Desktop Environment Window Manager**: A from-scratch X11 window manager with a Vulkan based compositor
 - **Noir Shell**: The Qt 6 / QML desktop shell (desktop, widgets, taskbar, start menu, system tray and notifications), rendered with Vulkan. See [src/shell/README.md](src/shell/README.md)
+- **Xvfb harness**: Runs the window manager and shell headlessly for inspection, debugging and smoke tests. See [tools/xvfb/README.md](tools/xvfb/README.md)
+- **Session and VM**: `noir-session` starts the desktop from a display manager, and a QEMU harness boots it on openSUSE Leap 15.6. See [tools/vm/README.md](tools/vm/README.md)

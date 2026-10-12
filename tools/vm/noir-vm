@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# noir-vm: build and run an openSUSE Leap 15.6 QEMU/KVM guest that boots
+# straight into the Noir Desktop Environment (LightDM -> noir-session ->
+# NoirWM + NoirShell). See tools/vm/README.md.
+set -euo pipefail
+
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SELF_DIR/../.." && pwd)
+BUILD=${NOIR_BUILD_DIR:-$REPO/build}
+VM=${NOIR_VM_DIR:-$BUILD/vm}
+
+IMAGE_NAME=openSUSE-Leap-15.6-Minimal-VM.x86_64-15.6.0-Cloud-Build19.146.qcow2
+IMAGE_URL=${NOIR_VM_IMAGE_URL:-https://download.opensuse.org/distribution/leap/15.6/appliances/$IMAGE_NAME}
+BASE=$VM/cache/leap-15.6-cloud.qcow2
+DISK=$VM/noir.qcow2
+SEED=$VM/seed.iso
+KEY=$VM/id_ed25519
+QMP=$VM/qmp.sock
+
+GUEST_USER=noir
+SSH_PORT=${NOIR_VM_SSH_PORT:-2226}
+VNC_DISPLAY=${NOIR_VM_VNC_DISPLAY:-26}          # TCP port 5900 + N, loopback only
+MEMORY=${NOIR_VM_MEMORY:-4096}
+CPUS=${NOIR_VM_CPUS:-4}
+RESOLUTION=${NOIR_VM_RESOLUTION:-1280x800}
+DISK_SIZE=${NOIR_VM_DISK_SIZE:-12G}
+# 1: virtio-gpu with 3D (virgl), so the guest gets accelerated OpenGL and
+# DRI3 from the host GPU. 0: plain framebuffer, everything on the guest CPU.
+GL=${NOIR_VM_GL:-1}
+
+# Runtime closure of the Noir binaries on Leap 15.6, plus an X server, a
+# display manager, a software Vulkan driver and a few clients to play with.
+GUEST_PACKAGES=(
+    kernel-default
+    xorg-x11-server xf86-input-libinput xorg-x11-fonts-core xorg-x11-fonts xauth xprop xdpyinfo wmctrl
+    lightdm lightdm-gtk-greeter sysvinit-tools   # the display-manager script needs startproc
+    Mesa-dri Mesa-libGL1 Mesa-libEGL1 libvulkan1 libvulkan_lvp Mesa-vulkan-device-select vulkan-tools
+    libQt6Quick6 libQt6Svg6 libQt6DBus6 libQt6OpenGL6 qt6-declarative-imports qt6-qt5compat-imports
+    libXcomposite1 libXdamage1 libXrender1 libXtst6 libXfixes3 libXext6 libXft2 Mesa-demo-x
+    google-roboto-fonts dejavu-fonts adwaita-icon-theme hicolor-icon-theme
+    xterm xclock xeyes libnotify-tools dbus-1 gdb ImageMagick
+)
+
+usage() {
+    cat <<EOF
+Usage: noir-vm <command> [options]
+
+Lifecycle
+  up [--gui]            everything: fetch, create, start, provision, deploy
+  fetch                 download and verify the Leap 15.6 Minimal-VM cloud image
+  create                create the VM disk, SSH key and cloud-init seed
+  start [--gui]         boot the VM (headless with VNC; --gui adds a QEMU window)
+  provision             wait for first boot to install packages and reboot
+  deploy                build, install into the guest, restart the session
+  stop                  shut the guest down cleanly
+  destroy               stop and delete the VM disk (keeps the downloaded image)
+  status                VM state, guest session and renderer
+
+Look and poke
+  view                  open the guest screen in a VNC viewer
+  shot [FILE]           screenshot of the guest screen
+  ssh [CMD...]          shell (or one command) in the guest as '$GUEST_USER'
+  session CMD...        run CMD inside the guest's X session (DISPLAY and session bus set)
+  spawn CMD...          start a client in the guest's X session and leave it running
+  click X Y [BUTTON] | key COMBO... | type TEXT    synthesize input in the guest
+  eval 'EXPR' | tree [WINDOW] | windows            NoirShell debug interface
+  logs [shell|wm|lightdm|xorg|cloud-init]          guest logs
+
+Environment: NOIR_VM_DIR ($VM), NOIR_VM_SSH_PORT ($SSH_PORT), NOIR_VM_VNC_DISPLAY ($VNC_DISPLAY),
+NOIR_VM_MEMORY ($MEMORY MiB), NOIR_VM_CPUS ($CPUS), NOIR_VM_RESOLUTION ($RESOLUTION), NOIR_VM_DISK_SIZE ($DISK_SIZE),
+NOIR_VM_GL ($GL; 0 turns off virtio-gpu 3D).
+Guest login: $GUEST_USER / noir (sudo without password).
+EOF
+}
+
+die() { echo "noir-vm: $*" >&2; exit 1; }
+say() { echo "noir-vm: $*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+running() {
+    local pid
+    [[ -s $VM/qemu.pid ]] && pid=$(<"$VM/qemu.pid") && kill -0 "$pid" 2>/dev/null
+}
+
+SSH_OPTS=(-i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o LogLevel=ERROR -o ConnectTimeout=5 -o BatchMode=yes)
+
+guest() { ssh "${SSH_OPTS[@]}" "$GUEST_USER@127.0.0.1" "$@"; }
+
+# Run a command inside the graphical session of the guest user.
+in_session() {
+    local quoted
+    printf -v quoted '%q ' "$@"
+    guest "export DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$(id -u)/bus QT_FORCE_STDERR_LOGGING=1; $quoted"
+}
+
+debug_call() {
+    local method=$1; shift
+    in_session dbus-send --session --print-reply=literal --dest=org.siriusos.NoirShell /Debug \
+        "org.siriusos.NoirShell.Debug.$method" "$@" | sed '1s/^   //'
+}
+
+# qmp JSON-COMMAND: send one command to the QEMU monitor, print the reply.
+qmp() {
+    running || die "the VM is not running"
+    python3 - "$QMP" "$1" <<'EOF'
+import json, socket, sys
+sock = socket.socket(socket.AF_UNIX)
+sock.connect(sys.argv[1])
+stream = sock.makefile("rw")
+def reply():
+    while True:
+        message = json.loads(stream.readline())
+        if "return" in message or "error" in message:
+            return message
+stream.readline()                                   # greeting
+for command in ('{"execute": "qmp_capabilities"}', sys.argv[2]):
+    stream.write(command + "\n"); stream.flush()
+    result = reply()
+print(json.dumps(result))
+sys.exit(1 if "error" in result else 0)
+EOF
+}
+
+wait_for_ssh() {
+    local seconds=${1:-180}
+    for ((i = 0; i < seconds; i += 2)); do
+        running || die "QEMU exited; see $VM/qemu.log"
+        guest true 2>/dev/null && return 0
+        sleep 2
+    done
+    die "the guest did not answer on SSH within ${seconds}s (console: $VM/console.log)"
+}
+
+cmd_fetch() {
+    need curl; need sha256sum
+    mkdir -p "$VM/cache"
+    if [[ ! -s $BASE ]]; then
+        say "downloading $IMAGE_NAME"
+        curl -fL --retry 3 --progress-bar -o "$BASE.part" "$IMAGE_URL"
+        mv "$BASE.part" "$BASE"
+    fi
+    if [[ ! -s $BASE.sha256 ]]; then
+        curl -fsSL -o "$BASE.sha256" "$IMAGE_URL.sha256"
+    fi
+    local expected actual
+    expected=$(awk '{print $1; exit}' "$BASE.sha256")
+    actual=$(sha256sum "$BASE" | awk '{print $1}')
+    [[ $expected == "$actual" ]] || die "checksum mismatch for $BASE (delete it and fetch again)"
+    say "base image verified: $BASE"
+}
+
+cmd_create() {
+    need qemu-img; need ssh-keygen
+    [[ -s $BASE ]] || cmd_fetch
+    running && die "the VM is running (noir-vm stop)"
+    mkdir -p "$VM"
+
+    [[ -s $KEY ]] || ssh-keygen -q -t ed25519 -N "" -C noir-vm -f "$KEY"
+
+    if [[ ! -s $DISK ]]; then
+        qemu-img create -q -f qcow2 -F qcow2 -b "$BASE" "$DISK" "$DISK_SIZE"
+        say "created $DISK ($DISK_SIZE, backed by the base image)"
+    fi
+
+    # cloud-init NoCloud seed: a volume labelled "cidata".
+    local seed_dir=$VM/seed
+    rm -rf "$seed_dir"; mkdir -p "$seed_dir"
+    local packages
+    packages=$(IFS=,; echo "${GUEST_PACKAGES[*]}")
+    printf 'instance-id: noir-%s\nlocal-hostname: noir\n' "$(date +%s)" >"$seed_dir/meta-data"
+    {
+        cat <<EOF
+#cloud-config
+users:
+  - name: $GUEST_USER
+    gecos: Noir
+    groups: [users, video]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: false
+    plain_text_passwd: noir
+    ssh_authorized_keys:
+      - $(<"$KEY.pub")
+ssh_pwauth: false
+write_files:
+  - path: /etc/lightdm/lightdm.conf.d/50-noir.conf
+    content: |
+      [Seat:*]
+      autologin-user=$GUEST_USER
+      autologin-user-timeout=0
+      autologin-session=noir
+      user-session=noir
+  - path: /etc/noir/session.conf
+    content: |
+      # Read by noir-session. The debug interface lets the host inspect the shell.
+      NOIR_SHELL_ARGS="--debug-interface"
+  - path: /etc/X11/xorg.conf.d/50-noir-vm.conf
+    content: |
+      Section "ServerFlags"
+          Option "BlankTime" "0"
+          Option "StandbyTime" "0"
+          Option "SuspendTime" "0"
+          Option "OffTime" "0"
+      EndSection
+runcmd:
+  - [zypper, --non-interactive, --gpg-auto-import-keys, refresh]
+  - [zypper, --non-interactive, install, --no-recommends, --force-resolution, $packages]
+  - [sh, -c, "sed -i -e 's/^DISPLAYMANAGER_AUTOLOGIN=.*/DISPLAYMANAGER_AUTOLOGIN=\"$GUEST_USER\"/' -e 's/^DISPLAYMANAGER=.*/DISPLAYMANAGER=\"lightdm\"/' /etc/sysconfig/displaymanager || true"]
+  - [systemctl, set-default, graphical.target]
+  - [touch, /var/lib/noir-provisioned]
+power_state:
+  mode: reboot
+  message: Noir VM provisioned, rebooting
+  condition: test -e /var/lib/noir-provisioned
+EOF
+    } >"$seed_dir/user-data"
+
+    if command -v xorriso >/dev/null 2>&1; then
+        xorriso -as mkisofs -quiet -o "$SEED" -V cidata -J -r "$seed_dir/user-data" "$seed_dir/meta-data"
+    else
+        need mkisofs
+        mkisofs -quiet -o "$SEED" -V cidata -J -r "$seed_dir/user-data" "$seed_dir/meta-data"
+    fi
+    say "created cloud-init seed $SEED"
+}
+
+cmd_start() {
+    local gui=0
+    [[ ${1:-} == --gui ]] && gui=1
+    need qemu-system-x86_64
+    running && die "the VM is already running (pid $(<"$VM/qemu.pid"))"
+    [[ -s $DISK && -s $SEED ]] || cmd_create
+    [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not accessible; KVM is required"
+    [[ $RESOLUTION =~ ^([0-9]+)x([0-9]+)$ ]] || die "NOIR_VM_RESOLUTION expects WxH"
+    local xres=${BASH_REMATCH[1]} yres=${BASH_REMATCH[2]}
+
+    rm -f "$QMP" "$VM/qemu.pid"
+    # With 3D the guest's GL commands are replayed on the host GPU, which
+    # needs a GL-capable display backend even when nothing is shown.
+    local -a display=(-display none) gpu=(-device "virtio-vga,xres=$xres,yres=$yres")
+    ((gui)) && display=(-display gtk,zoom-to-fit=off)
+    if ((GL)); then
+        gpu=(-device "virtio-vga-gl,xres=$xres,yres=$yres")
+        display=(-display egl-headless)
+        ((gui)) && display=(-display gtk,gl=on,zoom-to-fit=off)
+    fi
+
+    : >"$VM/qemu.log"
+    setsid qemu-system-x86_64 \
+        -name noir-vm -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEMORY" \
+        -drive "file=$DISK,if=virtio,format=qcow2,discard=unmap" \
+        -drive "file=$SEED,if=virtio,format=raw,readonly=on" \
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" -device virtio-net-pci,netdev=net0 \
+        "${gpu[@]}" \
+        -device qemu-xhci -device usb-tablet -device usb-kbd \
+        -device virtio-rng-pci \
+        -vnc "127.0.0.1:$VNC_DISPLAY" "${display[@]}" \
+        -qmp "unix:$QMP,server=on,wait=off" \
+        -serial "file:$VM/console.log" \
+        -pidfile "$VM/qemu.pid" >>"$VM/qemu.log" 2>&1 </dev/null &
+    disown
+
+    for _ in {1..50}; do
+        [[ -s $VM/qemu.pid ]] && break
+        sleep 0.1
+    done
+    sleep 0.5
+    running || { cat "$VM/qemu.log" >&2; die "QEMU failed to start"; }
+    say "VM started (pid $(<"$VM/qemu.pid")): VNC 127.0.0.1:$((5900 + VNC_DISPLAY)), SSH port $SSH_PORT, 3D $( ((GL)) && echo on || echo off)"
+}
+
+cmd_provision() {
+    running || die "the VM is not running (noir-vm start)"
+    say "waiting for the guest to boot"
+    wait_for_ssh 300
+    if ! guest test -e /var/lib/noir-provisioned; then
+        say "first boot: cloud-init is installing packages (a few minutes); progress in 'noir-vm logs cloud-init'"
+        for ((i = 0; i < 900; i += 5)); do
+            running || die "QEMU exited; see $VM/qemu.log"
+            guest test -e /var/lib/noir-provisioned 2>/dev/null && break
+            if guest "sudo cloud-init status 2>/dev/null | grep -q 'status: error'" 2>/dev/null; then
+                guest sudo tail -n 40 /var/log/cloud-init-output.log >&2 || true
+                die "cloud-init failed in the guest"
+            fi
+            sleep 5
+        done
+        guest test -e /var/lib/noir-provisioned || die "provisioning did not finish within 15 minutes"
+        say "packages installed; waiting for the guest to reboot into the new kernel"
+        # The reboot drops SSH; wait for it to go away and come back.
+        for _ in {1..30}; do guest true 2>/dev/null || break; sleep 2; done
+        wait_for_ssh 300
+    fi
+    say "guest is provisioned: $(guest uname -r)"
+}
+
+cmd_deploy() {
+    running || die "the VM is not running (noir-vm start)"
+    need cmake
+    wait_for_ssh 120
+    say "building"
+    cmake -B "$BUILD" -S "$REPO" -Wno-dev >/dev/null
+    cmake --build "$BUILD" >/dev/null
+    rm -rf "$VM/stage"
+    DESTDIR=$VM/stage cmake --install "$BUILD" --prefix /usr >/dev/null
+    say "installing into the guest: $(cd "$VM/stage" && find . -type f | sed 's/^\.//' | tr '\n' ' ')"
+    tar -C "$VM/stage" -cf - . | guest "sudo tar -C / --no-same-owner --touch -xf - && sudo ldconfig"
+    guest sudo systemctl restart display-manager
+    say "waiting for the Noir session"
+    for _ in {1..60}; do
+        if guest "pgrep -u $GUEST_USER -x NoirShell" >/dev/null 2>&1 \
+           && debug_call Windows 2>/dev/null | grep -q '"Noir Taskbar"'; then
+            say "Noir session is up. Look at it with: noir-vm view   (or: noir-vm shot)"
+            return 0
+        fi
+        sleep 1
+    done
+    cmd_logs shell >&2 || true
+    die "the Noir session did not come up; see 'noir-vm logs lightdm' and 'noir-vm logs xorg'"
+}
+
+cmd_stop() {
+    running || { say "the VM is not running"; return 0; }
+    local pid; pid=$(<"$VM/qemu.pid")
+    qmp '{"execute": "system_powerdown"}' >/dev/null 2>&1 || true
+    for _ in {1..60}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        say "guest did not power off; killing QEMU"
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$VM/qemu.pid" "$QMP"
+    say "VM stopped"
+}
+
+cmd_destroy() {
+    cmd_stop
+    rm -rf "$DISK" "$SEED" "$VM/seed" "$VM/stage" "$VM/console.log" "$VM/qemu.log"
+    say "VM disk deleted (base image kept in $VM/cache)"
+}
+
+cmd_status() {
+    if ! running; then
+        echo "VM       not running"
+        [[ -s $DISK ]] && echo "disk     $DISK ($(du -h "$DISK" | cut -f1))"
+        return 1
+    fi
+    echo "VM       pid $(<"$VM/qemu.pid"), ${CPUS} CPUs, ${MEMORY} MiB, $RESOLUTION"
+    echo "disk     $DISK ($(du -h "$DISK" | cut -f1))"
+    echo "VNC      127.0.0.1:$((5900 + VNC_DISPLAY))   SSH  127.0.0.1:$SSH_PORT ($GUEST_USER)"
+    if ! guest true 2>/dev/null; then
+        echo "guest    not answering on SSH yet"
+        return 0
+    fi
+    guest '. /etc/os-release; echo "guest    $PRETTY_NAME, kernel $(uname -r)"
+           echo "dm       $(systemctl is-active display-manager) ($(readlink -f /etc/alternatives/default-displaymanager 2>/dev/null | xargs -r basename))"
+           echo "session  $(pgrep -a -u '"$GUEST_USER"' -x "NoirWM|NoirShell" | sed "s/^[0-9]* //" | paste -sd";" -)"'
+    if in_session true 2>/dev/null; then
+        echo "wm       $(in_session wmctrl -m 2>/dev/null | sed -n 's/^Name: //p')"
+        echo "shell    rendering with $(guest "sed -n 's/^NoirShell: rendering with //p' ~/.local/state/noir/shell.log 2>/dev/null | head -n 1 | cut -d: -f1")"
+        echo "wm       $(guest "sed -n 's/^NoirWM: //p' ~/.local/state/noir/wm.log 2>/dev/null | head -n 1")"
+        echo "opengl   $(in_session glxinfo -B 2>/dev/null | sed -n 's/^OpenGL renderer string: //p')"
+        echo "surfaces:"
+        debug_call Windows 2>/dev/null | grep visible | sed 's/^/  /' || true
+    fi
+}
+
+cmd_view() {
+    running || die "the VM is not running (noir-vm start)"
+    local port=$((5900 + VNC_DISPLAY))
+    if command -v vncviewer >/dev/null 2>&1; then
+        exec vncviewer "127.0.0.1::$port"
+    elif command -v remote-viewer >/dev/null 2>&1; then
+        exec remote-viewer "vnc://127.0.0.1:$port"
+    fi
+    die "no VNC viewer found; connect one to 127.0.0.1:$port"
+}
+
+cmd_shot() {
+    local file=${1:-$VM/shots/vm-$(date +%H%M%S).png}
+    file=$(realpath -m "$file")
+    mkdir -p "$(dirname "$file")"
+    # QEMU can dump its own framebuffer, but not a 3D (GL) scanout; in that
+    # case grab the X screen from inside the guest instead.
+    if ! qmp "{\"execute\": \"screendump\", \"arguments\": {\"filename\": \"$file\", \"format\": \"png\"}}" >/dev/null 2>&1; then
+        in_session import -silent -window root png:- >"$file" 2>/dev/null
+        [[ -s $file ]] || { rm -f "$file"; die "shot: neither QEMU nor the guest session could capture the screen"; }
+    fi
+    echo "$file"
+}
+
+cmd_logs() {
+    case ${1:-shell} in
+        shell) guest "tail -n 60 ~/.local/state/noir/shell.log" ;;
+        wm) guest "tail -n 60 ~/.local/state/noir/wm.log" ;;
+        lightdm) guest "sudo tail -n 60 /var/log/lightdm/lightdm.log" ;;
+        xorg) guest "sudo tail -n 80 /var/log/Xorg.0.log 2>/dev/null || sudo tail -n 80 /var/log/lightdm/x-0.log" ;;
+        cloud-init) guest "sudo tail -n 60 /var/log/cloud-init-output.log" ;;
+        *) die "logs: expected shell, wm, lightdm, xorg or cloud-init" ;;
+    esac
+}
+
+command=${1:-help}
+shift || true
+case $command in
+    up)
+        [[ -s $BASE ]] || cmd_fetch
+        [[ -s $DISK && -s $SEED ]] || cmd_create
+        running || cmd_start "$@"
+        cmd_provision
+        cmd_deploy ;;
+    fetch) cmd_fetch ;;
+    create) cmd_create ;;
+    start) cmd_start "$@" ;;
+    provision) cmd_provision ;;
+    deploy) cmd_deploy ;;
+    stop) cmd_stop ;;
+    destroy) cmd_destroy ;;
+    status) cmd_status ;;
+    view) cmd_view ;;
+    shot) cmd_shot "$@" ;;
+    ssh) if (($#)); then guest "$@"; else exec ssh "${SSH_OPTS[@]}" -o BatchMode=no -t "$GUEST_USER@127.0.0.1"; fi ;;
+    session) (($#)) || die "session: expected a command"; in_session "$@" ;;
+    spawn)
+        (($#)) || die "spawn: expected a command"
+        printf -v quoted '%q ' "$@"
+        # Detach fully, or the SSH connection would stay open for the client's lifetime.
+        in_session sh -c "setsid $quoted >>\$HOME/.local/state/noir/clients.log 2>&1 </dev/null &" ;;
+    click | key | type | move | drag | scroll) in_session noir-xinject "$command" "$@" ;;
+    eval) (($# == 1)) || die "eval: expected one expression"; echo "$(debug_call Eval "string:$1")" ;;
+    tree) debug_call ItemTree "string:${1:-}" boolean:true ;;
+    windows) debug_call Windows ;;
+    logs) cmd_logs "$@" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac

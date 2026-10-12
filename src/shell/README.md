@@ -39,6 +39,7 @@ src/shell/
 │   ├── TaskModel.*          _NET_CLIENT_LIST task list + _NET_WM_ICON provider
 │   ├── AppModel.*           XDG .desktop parser, search filter, theme icons
 │   ├── SystemMonitor.*      /proc and /sys poller (CPU, memory, battery, net)
+│   ├── DebugInterface.*     org.siriusos.NoirShell.Debug (--debug-interface)
 │   └── NotificationServer.* org.freedesktop.Notifications server + model
 ├── qml/                     UI (Theme singleton + components)
 └── icons/                   first-party SVG icons
@@ -83,14 +84,55 @@ activate, `Esc` closes menus, `Delete` dismisses a focused notification.
 In the taskbar, clicking the active task minimizes it and middle-click closes
 it.
 
-Useful environment variables: `QSG_RHI_BACKEND=opengl` to bypass Vulkan while
-debugging, `QSG_INFO=1` to print the renderer in use.
+`--backend vulkan|opengl|software` picks the renderer (the `QSG_RHI_BACKEND`
+environment variable is honoured too). The default, `auto`, picks:
+
+| Situation | Renderer |
+| --- | --- |
+| Hardware Vulkan device and an X server with DRI3 | Vulkan |
+| Only a software Vulkan device (lavapipe), no compositor | Vulkan on the CPU |
+| Only a software Vulkan device, compositor running | OpenGL, because Mesa's software Vulkan cannot present to ARGB windows |
+| No usable Vulkan device | OpenGL |
+
+The choice is logged at startup, and `QSG_INFO=1` prints the full renderer
+details.
+
+The taskbar, start menu and notification surfaces ask for a translucent
+(ARGB) window only when a compositing manager owns `_NET_WM_CM_S0` and the
+renderer can present to one; otherwise they are opaque black around their
+content. The desktop surface is always opaque.
+
+## Headless inspection and debugging
+
+[`tools/xvfb/noir-xvfb`](../../tools/xvfb/README.md) boots NoirWM and the
+shell on a private Xvfb display and D-Bus session, and lets you screenshot
+it, dump the Qt Quick item tree, evaluate QML and inject input:
+
+```bash
+tools/xvfb/noir-xvfb start
+tools/xvfb/noir-xvfb click '@toolTip="Applications"'
+tools/xvfb/noir-xvfb shot
+tools/xvfb/noir-xvfb stop
+```
+
+It relies on `--debug-interface`, which exports
+`org.siriusos.NoirShell.Debug` at `/Debug` on the session bus with
+`Windows()`, `ItemTree(window, visibleOnly)`, `Grab(window, path)` and
+`Eval(expression)`. `Eval` runs arbitrary QML/JavaScript inside the shell, so
+the interface is off unless the flag is given.
 
 Try a notification from another process:
 
 ```bash
 notify-send -u critical "Hello" "From org.freedesktop.Notifications"
 ```
+
+## Running as a session
+
+`cmake --install` adds [`noir-session`](../session/noir-session) and an
+`xsessions/noir.desktop` entry, so a display manager can start the whole
+desktop (NoirWM, then the shell). [`tools/vm/noir-vm`](../../tools/vm/README.md)
+builds an openSUSE Leap 15.6 QEMU guest that boots into it through LightDM.
 
 ## Integration with NoirWM and the compositor
 
@@ -101,20 +143,23 @@ the taskbar reads `_NET_CLIENT_LIST` / `_NET_ACTIVE_WINDOW` and sends
 the desktop at the bottom, the taskbar and popups on top, and reserves the
 taskbar's strut in `_NET_WORKAREA`.
 
-NoirWM's Vulkan compositor does not draw client windows yet, so for now run
-the shell with `NoirWM --no-compositor` (or under any EWMH window manager, or
-in `--windowed` mode):
+NoirWM composites by default, so the glass surfaces are blended over the
+windows behind them:
 
 ```bash
-# in ~/.xinitrc, or via xinit
-NoirWM --no-compositor &
+# in ~/.xinitrc, or use noir-session
+NoirWM &
 exec NoirShell
 ```
 
-Without a compositor, the translucent margins of popups render as black.
+Start the shell after NoirWM: it checks for the compositing manager once, at
+startup. Under any other EWMH window manager, or with `NoirWM
+--no-compositor`, the shell still works with opaque surfaces.
+
 The window-level effects in the VDD (wobbly move, magic-lamp minimize,
 shattering close, 3D cube workspaces, flip carousel task switching, dialog
-expansion) belong to the compositor rather than the shell.
+expansion) belong to the compositor rather than the shell, and are not
+implemented yet.
 
 ## Next steps
 

@@ -47,7 +47,8 @@ QtObject {
     property Window panelWindow: Window {
         title: "Noir Taskbar"
         flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
-        color: Theme.black
+        // Black glass over the desktop when a compositor can blend it.
+        color: shellComposited ? "transparent" : Theme.black
         x: shell.screenInfo.virtualX
         y: shell.screenInfo.virtualY + shell.screenInfo.height - Theme.taskbarHeight
         width: shell.screenInfo.width
@@ -77,7 +78,9 @@ QtObject {
         id: menuWindow
         title: "Noir Applications"
         flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        color: "transparent"
+        // A transparent colour makes Qt pick an ARGB visual; only ask for
+        // one when a compositing manager is there to blend it.
+        color: shellComposited ? "transparent" : Theme.black
         // Extra margin on the right leaves room for the drop shadow.
         width: startMenu.width + 16
         height: startMenu.height + 4
@@ -107,7 +110,7 @@ QtObject {
     property Window notificationWindow: Window {
         title: "Noir Notifications"
         flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        color: "transparent"
+        color: shellComposited ? "transparent" : Theme.black
         width: 400
         height: Math.max(1, stack.contentHeight + 24)
         x: shell.screenInfo.virtualX + shell.screenInfo.width - width

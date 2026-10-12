@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=XSession
+Name=Noir
+Comment=SiriusOS Noir Desktop Environment
+Exec=noir-session
+TryExec=noir-session
+DesktopNames=Noir

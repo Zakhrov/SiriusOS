@@ -1,12 +1,13 @@
 #include "Client.h"
 #include "Ewmh.h"
+#include "Frame.h"
 
 #include <X11/Xutil.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define BORDER_WIDTH 1
-#define BORDER_SILVER 0xc3c7cf
+#define CASCADE_STEP 28
+#define CASCADE_SLOTS 8
 
 NoirClient* client_find(NoirWM* wm, Window window) {
     for (int i = 0; i < wm->clientCount; i++) {
@@ -15,6 +16,45 @@ NoirClient* client_find(NoirWM* wm, Window window) {
         }
     }
     return NULL;
+}
+
+NoirClient* client_find_frame(NoirWM* wm, Window frame) {
+    for (int i = 0; i < wm->clientCount; i++) {
+        if (wm->clients[i].frame == frame) {
+            return &wm->clients[i];
+        }
+    }
+    return NULL;
+}
+
+Window client_toplevel(const NoirClient* client) {
+    return client->frame ? client->frame : client->window;
+}
+
+void wm_get_workarea(NoirWM* wm, long area[4]) {
+    area[0] = 0; area[1] = 0;
+    area[2] = wm->screenWidth; area[3] = wm->screenHeight;
+    ewmh_get_cardinals(wm->display, wm->root, noirAtoms[NET_WORKAREA], area, 4);
+}
+
+// _MOTIF_WM_HINTS with the decorations field cleared: how toolkits ask for a
+// frameless window (Qt.FramelessWindowHint, GTK undecorated).
+static int motif_undecorated(NoirWM* wm, Window window) {
+    long hints[5] = { 0 };
+    Atom type;
+    int format;
+    unsigned long count = 0, remaining;
+    unsigned char* data = NULL;
+    int undecorated = 0;
+    if (XGetWindowProperty(wm->display, window, noirAtoms[MOTIF_WM_HINTS], 0, 5, False, AnyPropertyType,
+                           &type, &format, &count, &remaining, &data) == Success && data) {
+        if (format == 32 && count >= 3) {
+            memcpy(hints, data, sizeof(long) * (count < 5 ? count : 5));
+            undecorated = (hints[0] & 2) && hints[2] == 0;   // MWM_HINTS_DECORATIONS
+        }
+        XFree(data);
+    }
+    return undecorated;
 }
 
 static void set_wm_state(NoirWM* wm, Window window, long state) {
@@ -46,7 +86,8 @@ static void read_type(NoirWM* wm, NoirClient* client) {
     else if (ewmh_has_atom(d, client->window, noirAtoms[NET_WM_STATE], noirAtoms[NET_WM_STATE_BELOW])) client->layer = LAYER_BELOW;
     else client->layer = LAYER_NORMAL;
 
-    client->decorated = !(isDesktop || isDock || isOverlay || isUndecorated);
+    client->decorated = !(isDesktop || isDock || isOverlay || isUndecorated) &&
+                        !motif_undecorated(wm, client->window);
     client->isShellSurface = isDesktop || isDock || isOverlay;
     client->focusOnClick = !client->isShellSurface ||
         ewmh_has_atom(d, client->window, noirAtoms[NET_WM_WINDOW_TYPE], noirAtoms[NET_WM_WINDOW_TYPE_NOTIFICATION]);
@@ -64,14 +105,66 @@ static void read_type(NoirWM* wm, NoirClient* client) {
     client->takesFocus = ewmh_supports_protocol(d, client->window, noirAtoms[WM_TAKE_FOCUS]);
 }
 
-static void apply_decoration(NoirWM* wm, NoirClient* client) {
-    const int border = client->decorated ? BORDER_WIDTH : 0;
-    XSetWindowBorderWidth(wm->display, client->window, border);
-    if (border && DefaultDepth(wm->display, DefaultScreen(wm->display)) >= 24) {
-        XSetWindowBorder(wm->display, client->window, BORDER_SILVER);
+// Where a new decorated window goes: where it asked to be if it said so,
+// otherwise cascading down from the top-left of the work area.
+static void place_frame(NoirWM* wm, NoirClient* client, const XWindowAttributes* wa, int keepPosition) {
+    long area[4];
+    wm_get_workarea(wm, area);
+    client->width = wa->width;
+    client->height = wa->height;
+    frame_constrain_size(client, &client->width, &client->height);
+    const int maxWidth = (int)area[2] - 2 * FRAME_BORDER, maxHeight = (int)area[3] - FRAME_TITLE - FRAME_BORDER;
+    if (client->width > maxWidth) client->width = maxWidth;
+    if (client->height > maxHeight) client->height = maxHeight;
+    const int fw = client->width + 2 * FRAME_BORDER, fh = client->height + FRAME_TITLE + FRAME_BORDER;
+
+    XSizeHints hints;
+    long supplied;
+    const int positioned = XGetWMNormalHints(wm->display, client->window, &hints, &supplied) &&
+                           (hints.flags & (USPosition | PPosition));
+    if (keepPosition) {
+        // Already on screen (NoirWM restarted): wrap the frame around it.
+        client->x = wa->x - FRAME_BORDER;
+        client->y = wa->y - FRAME_TITLE;
+    } else if (positioned) {
+        client->x = wa->x;
+        client->y = wa->y;
+    } else {
+        const int offset = 32 + CASCADE_STEP * (wm->placementStep++ % CASCADE_SLOTS);
+        client->x = (int)area[0] + 120 + offset;
+        client->y = (int)area[1] + offset;
     }
-    const long extents[4] = { border, border, border, border };
-    ewmh_set_cardinals(wm->display, client->window, noirAtoms[NET_FRAME_EXTENTS], extents, 4);
+    if (client->x + fw > area[0] + area[2]) client->x = (int)(area[0] + area[2]) - fw;
+    if (client->y + fh > area[1] + area[3]) client->y = (int)(area[1] + area[3]) - fh;
+    if (client->x < area[0]) client->x = (int)area[0];
+    if (client->y < area[1]) client->y = (int)area[1];
+}
+
+// Give the client a frame, or take it away, to match client->decorated.
+static void apply_decoration(NoirWM* wm, NoirClient* client, int keepPosition) {
+    Display* d = wm->display;
+    if (client->decorated && !client->frame) {
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(d, client->window, &wa)) {
+            return;
+        }
+        frame_read_size_hints(wm, client);
+        frame_read_title(wm, client);
+        frame_read_icon(wm, client);
+        place_frame(wm, client, &wa, keepPosition);
+        frame_create(wm, client);
+        frame_apply_geometry(wm, client);
+        if (wa.map_state != IsUnmapped && !client->minimized) {
+            XMapWindow(d, client->frame);
+        }
+    } else if (!client->decorated) {
+        if (client->frame) {
+            frame_destroy(wm, client);
+        }
+        XSetWindowBorderWidth(d, client->window, 0);
+        const long extents[4] = { 0, 0, 0, 0 };
+        ewmh_set_cardinals(d, client->window, noirAtoms[NET_FRAME_EXTENTS], extents, 4);
+    }
 }
 
 void client_update_strut(NoirWM* wm, NoirClient* client) {
@@ -88,24 +181,23 @@ void client_update_strut(NoirWM* wm, NoirClient* client) {
 
 void client_update_type(NoirWM* wm, NoirClient* client) {
     read_type(wm, client);
-    apply_decoration(wm, client);
+    apply_decoration(wm, client, 1);
     wm_restack(wm);
 }
 
-// Keep new normal windows inside the work area (i.e. clear of the taskbar).
+// Keep new frameless normal windows inside the work area (clear of the taskbar).
 static void place_client(NoirWM* wm, NoirClient* client) {
-    if (client->layer != LAYER_NORMAL) {
+    if (client->layer != LAYER_NORMAL || client->frame) {
         return;
     }
-    long area[4] = { 0, 0, wm->screenWidth, wm->screenHeight };
-    ewmh_get_cardinals(wm->display, wm->root, noirAtoms[NET_WORKAREA], area, 4);
+    long area[4];
+    wm_get_workarea(wm, area);
 
     XWindowAttributes wa;
     if (!XGetWindowAttributes(wm->display, client->window, &wa)) {
         return;
     }
-    const int border = client->decorated ? BORDER_WIDTH : 0;
-    const int w = wa.width + 2 * border, h = wa.height + 2 * border;
+    const int w = wa.width, h = wa.height;
     int x = wa.x, y = wa.y;
     if (x + w > area[0] + area[2]) x = (int)(area[0] + area[2]) - w;
     if (y + h > area[1] + area[3]) y = (int)(area[1] + area[3]) - h;
@@ -141,8 +233,14 @@ NoirClient* client_manage(NoirWM* wm, Window window) {
     XGrabButton(d, AnyButton, AnyModifier, window, False, ButtonPressMask,
                 GrabModeSync, GrabModeAsync, None, None);
 
+    XWindowAttributes wa;
+    const int alreadyMapped = XGetWindowAttributes(d, window, &wa) && wa.map_state != IsUnmapped;
     read_type(wm, client);
-    apply_decoration(wm, client);
+    apply_decoration(wm, client, alreadyMapped);
+    if (client->frame && (ewmh_has_atom(d, window, noirAtoms[NET_WM_STATE], noirAtoms[NET_WM_STATE_MAXIMIZED_VERT]) ||
+                          ewmh_has_atom(d, window, noirAtoms[NET_WM_STATE], noirAtoms[NET_WM_STATE_MAXIMIZED_HORZ]))) {
+        client_set_maximized(wm, client, 1);
+    }
 
     const long desktop = client->layer == LAYER_DESKTOP || client->layer == LAYER_ABOVE ? 0xFFFFFFFFL : 0;
     ewmh_set_cardinals(d, window, noirAtoms[NET_WM_DESKTOP], &desktop, 1);
@@ -162,6 +260,10 @@ void client_unmanage(NoirWM* wm, Window window) {
         }
         const int hadStrut = wm->clients[i].strut[0] || wm->clients[i].strut[1] ||
                              wm->clients[i].strut[2] || wm->clients[i].strut[3];
+        frame_destroy(wm, &wm->clients[i]);
+        if (wm->dragClient == window) {
+            wm->dragMode = DRAG_NONE;
+        }
         memmove(&wm->clients[i], &wm->clients[i + 1],
                 sizeof(NoirClient) * (size_t)(wm->clientCount - i - 1));
         wm->clientCount--;
@@ -177,8 +279,23 @@ void client_unmanage(NoirWM* wm, Window window) {
 }
 
 void wm_set_active(NoirWM* wm, Window window) {
+    const Window previous = wm->activeWindow;
     wm->activeWindow = window;
     ewmh_set_windows(wm->display, wm->root, noirAtoms[NET_ACTIVE_WINDOW], &window, 1);
+    if (previous == window) {
+        return;
+    }
+    // Title bars show which window has the focus.
+    NoirClient* old = client_find(wm, previous);
+    if (old) {
+        ewmh_change_state(wm->display, previous, NET_WM_STATE_REMOVE, noirAtoms[NET_WM_STATE_FOCUSED]);
+        frame_draw(wm, old);
+    }
+    NoirClient* now = client_find(wm, window);
+    if (now) {
+        ewmh_change_state(wm->display, window, NET_WM_STATE_ADD, noirAtoms[NET_WM_STATE_FOCUSED]);
+        frame_draw(wm, now);
+    }
 }
 
 static void send_protocol(NoirWM* wm, Window window, Atom protocol) {
@@ -196,13 +313,13 @@ void client_activate(NoirWM* wm, NoirClient* client) {
     Display* d = wm->display;
     if (client->minimized) {
         client->minimized = 0;
-        XMapWindow(d, client->window);
+        XMapWindow(d, client_toplevel(client));
         set_wm_state(wm, client->window, NormalState);
         ewmh_change_state(d, client->window, NET_WM_STATE_REMOVE, noirAtoms[NET_WM_STATE_HIDDEN]);
     }
     ewmh_change_state(d, client->window, NET_WM_STATE_REMOVE, noirAtoms[NET_WM_STATE_DEMANDS_ATTENTION]);
     if (client->layer != LAYER_DESKTOP) {
-        XRaiseWindow(d, client->window);
+        XRaiseWindow(d, client_toplevel(client));
     }
     wm_restack(wm);
 
@@ -221,7 +338,7 @@ void client_minimize(NoirWM* wm, NoirClient* client) {
     }
     // Mark first: the UnmapNotify this causes must not unmanage the window.
     client->minimized = 1;
-    XUnmapWindow(wm->display, client->window);
+    XUnmapWindow(wm->display, client_toplevel(client));
     set_wm_state(wm, client->window, IconicState);
     ewmh_change_state(wm->display, client->window, NET_WM_STATE_ADD, noirAtoms[NET_WM_STATE_HIDDEN]);
     if (wm->activeWindow == client->window) {
@@ -237,6 +354,49 @@ void client_close(NoirWM* wm, NoirClient* client) {
     }
 }
 
+void client_set_maximized(NoirWM* wm, NoirClient* client, int maximized) {
+    if (!client->frame) {
+        return;
+    }
+    if (maximized) {
+        if (!client->maximized) {
+            client->restoreX = client->x; client->restoreY = client->y;
+            client->restoreWidth = client->width; client->restoreHeight = client->height;
+        }
+        long area[4];
+        wm_get_workarea(wm, area);
+        client->x = (int)area[0];
+        client->y = (int)area[1];
+        client->width = (int)area[2] - 2 * FRAME_BORDER;
+        client->height = (int)area[3] - FRAME_TITLE - FRAME_BORDER;
+    } else if (client->maximized) {
+        client->x = client->restoreX; client->y = client->restoreY;
+        client->width = client->restoreWidth; client->height = client->restoreHeight;
+    }
+    client->maximized = maximized;
+    const long action = maximized ? NET_WM_STATE_ADD : NET_WM_STATE_REMOVE;
+    ewmh_change_state(wm->display, client->window, action, noirAtoms[NET_WM_STATE_MAXIMIZED_VERT]);
+    ewmh_change_state(wm->display, client->window, action, noirAtoms[NET_WM_STATE_MAXIMIZED_HORZ]);
+    frame_apply_geometry(wm, client);
+    frame_draw(wm, client);
+}
+
+void wm_cycle_focus(NoirWM* wm) {
+    int start = -1;
+    for (int i = 0; i < wm->clientCount; i++) {
+        if (wm->clients[i].window == wm->activeWindow) {
+            start = i;
+        }
+    }
+    for (int step = 1; step <= wm->clientCount; step++) {
+        NoirClient* c = &wm->clients[(start + step + wm->clientCount) % wm->clientCount];
+        if (!c->isShellSurface && c->window != wm->activeWindow) {
+            client_activate(wm, c);
+            return;
+        }
+    }
+}
+
 // Current X stacking order of managed clients, bottom to top.
 static int stacking_order(NoirWM* wm, Window* out) {
     Window rootReturn, parentReturn, *children = NULL;
@@ -246,8 +406,13 @@ static int stacking_order(NoirWM* wm, Window* out) {
         return 0;
     }
     for (unsigned int i = 0; i < count; i++) {
-        if (client_find(wm, children[i])) {
-            out[n++] = children[i];
+        // Decorated clients are on the root through their frame.
+        NoirClient* client = client_find_frame(wm, children[i]);
+        if (!client) {
+            client = client_find(wm, children[i]);
+        }
+        if (client && n < wm->clientCount) {
+            out[n++] = client->window;
         }
     }
     if (children) XFree(children);
@@ -269,7 +434,7 @@ void wm_restack(NoirWM* wm) {
         for (int i = count - 1; i >= 0; i--) {
             NoirClient* c = client_find(wm, current[i]);
             if (c && (int)c->layer == layer) {
-                order[n++] = current[i];
+                order[n++] = client_toplevel(c);
             }
         }
     }
@@ -309,6 +474,12 @@ void wm_update_workarea(NoirWM* wm) {
         wm->screenHeight - reserved[2] - reserved[3],
     };
     ewmh_set_cardinals(wm->display, wm->root, noirAtoms[NET_WORKAREA], workarea, 4);
+    // Maximized windows follow the work area (e.g. when the taskbar appears).
+    for (int i = 0; i < wm->clientCount; i++) {
+        if (wm->clients[i].maximized) {
+            client_set_maximized(wm, &wm->clients[i], 1);
+        }
+    }
 }
 
 void wm_focus_fallback(NoirWM* wm) {
@@ -344,11 +515,15 @@ void handle_map_request(NoirWM* wm, XMapRequestEvent* event) {
     }
     client->minimized = 0;
     XMapWindow(wm->display, event->window);
+    if (client->frame) {
+        XMapWindow(wm->display, client->frame);
+    }
     set_wm_state(wm, event->window, NormalState);
     ewmh_change_state(wm->display, event->window, NET_WM_STATE_REMOVE, noirAtoms[NET_WM_STATE_HIDDEN]);
 
-    // New application windows get focus; shell surfaces just take their layer.
-    if (!client->isShellSurface && (client->acceptsFocus || client->takesFocus)) {
+    // New application windows become the active one (and get the keyboard if
+    // they want it); shell surfaces just take their layer.
+    if (!client->isShellSurface) {
         client_activate(wm, client);
     } else {
         wm_restack(wm);
@@ -356,21 +531,33 @@ void handle_map_request(NoirWM* wm, XMapRequestEvent* event) {
 }
 
 void handle_configure_request(NoirWM* wm, XConfigureRequestEvent* event) {
-    XWindowChanges ch;
-    ch.x = event->x; ch.y = event->y;
-    ch.width = event->width; ch.height = event->height;
-    ch.border_width = event->border_width;
-    ch.sibling = event->above; ch.stack_mode = event->detail;
-
-    unsigned long mask = event->value_mask;
     NoirClient* client = client_find(wm, event->window);
-    if (client) {
-        // NoirWM owns borders and stacking order for managed windows.
-        mask &= ~(unsigned long)(CWBorderWidth | CWSibling | CWStackMode);
+    if (client && client->frame) {
+        // The frame is what moves; the client keeps its place inside it.
+        if (!client->maximized) {
+            if (event->value_mask & CWX) client->x = event->x;
+            if (event->value_mask & CWY) client->y = event->y;
+            if (event->value_mask & CWWidth) client->width = event->width;
+            if (event->value_mask & CWHeight) client->height = event->height;
+            frame_constrain_size(client, &client->width, &client->height);
+        }
+        frame_apply_geometry(wm, client);
+        frame_draw(wm, client);
+    } else {
+        XWindowChanges ch;
+        ch.x = event->x; ch.y = event->y;
+        ch.width = event->width; ch.height = event->height;
+        ch.border_width = event->border_width;
+        ch.sibling = event->above; ch.stack_mode = event->detail;
+        unsigned long mask = event->value_mask;
+        if (client) {
+            // NoirWM owns borders and stacking order for managed windows.
+            mask &= ~(unsigned long)(CWBorderWidth | CWSibling | CWStackMode);
+        }
+        XConfigureWindow(wm->display, event->window, (unsigned int)mask, &ch);
     }
-    XConfigureWindow(wm->display, event->window, (unsigned int)mask, &ch);
     if (client && (event->value_mask & CWStackMode) && event->detail == Above) {
-        XRaiseWindow(wm->display, event->window);
+        XRaiseWindow(wm->display, client_toplevel(client));
         wm_restack(wm);
     }
 }

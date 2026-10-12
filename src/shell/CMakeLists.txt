@@ -11,6 +11,7 @@ qt_add_executable(NoirShell
     src/AppModel.cpp src/AppModel.h
     src/SystemMonitor.cpp src/SystemMonitor.h
     src/NotificationServer.cpp src/NotificationServer.h
+    src/DebugInterface.cpp src/DebugInterface.h
 )
 
 set(NOIR_QML_FILES
@@ -69,7 +70,7 @@ qt_add_qml_module(NoirShell
 target_include_directories(NoirShell PRIVATE src)
 target_link_libraries(NoirShell PRIVATE
     Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::DBus Qt6::Svg
-    PkgConfig::XCB
+    PkgConfig::XCB Vulkan::Vulkan
 )
 
-install(TARGETS NoirShell RUNTIME DESTINATION bin)
+install(TARGETS NoirShell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

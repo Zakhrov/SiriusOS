@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# noir-xvfb: run the Noir session (NoirWM + NoirShell) on a headless Xvfb
+# display with a private D-Bus session bus, and inspect / drive it from the
+# command line. See tools/xvfb/README.md.
+set -euo pipefail
+
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SELF_DIR/../.." && pwd)
+BUILD=${NOIR_BUILD_DIR:-$REPO/build}
+STATE=${NOIR_XVFB_STATE:-$BUILD/xvfb}
+
+SHELL_BIN=$BUILD/src/shell/NoirShell
+WM_BIN=$BUILD/src/window_manager/NoirWM
+XINJECT_BIN=$BUILD/tools/xvfb/noir-xinject
+
+DEBUG_SERVICE=org.siriusos.NoirShell
+DEBUG_IFACE=org.siriusos.NoirShell.Debug
+
+usage() {
+    cat <<EOF
+Usage: noir-xvfb <command> [options]
+
+Session
+  start [options]         boot Xvfb, D-Bus, NoirWM and NoirShell
+      --size WxH            screen size (default 1280x720)
+      --display :N          use a fixed display number (default: first free)
+      --backend NAME        shell renderer: auto, opengl, software, vulkan
+      --demo                sample tasks and notifications (NoirShell --demo)
+      --windowed [WxH]      single-window development shell instead of the session
+      --no-wm               do not start a window manager
+      --compositor          let NoirWM composite (needs a software Vulkan driver such as
+                            lavapipe; point VK_DRIVER_FILES at its ICD if it is not installed)
+      --wm "CMD"            window manager command (default: NoirWM --no-compositor)
+      --wrap "CMD"          prefix for the shell command, e.g. "gdb -batch -ex run -ex bt --args"
+  stop                    tear everything down
+  reload [--no-build]     rebuild NoirShell and restart only the shell
+  status                  processes, EWMH state and managed windows
+  smoke                   boot a throwaway session, check it, exit non-zero on failure
+
+Inspect
+  shot [FILE]             screenshot of the whole screen (X server contents)
+  grab WINDOW [FILE]      one shell surface rendered by the shell itself, with alpha
+  windows                 shell surfaces: id, geometry, state, title
+  tree [WINDOW] [--all]   Qt Quick item tree with screen coordinates (--all: hidden too)
+  eval 'EXPR'             evaluate QML/JS in Main.qml, e.g. 'shell.startMenuOpen = true'
+  logs [NAME] [-f]        tail a log: shell (default), wm, xvfb, dbus, clients, vnc
+  env                     print exports to point your own tools at the session
+
+Drive
+  click X Y [BUTTON]      click at screen coordinates
+  click @PATTERN [BUTTON] click the centre of the first visible item matching PATTERN
+  move X Y | drag X1 Y1 X2 Y2 | scroll N | key COMBO... | type TEXT
+  notify SUMMARY [BODY]   send a desktop notification
+  run CMD...              run a command inside the session (foreground)
+  spawn CMD...            start a client inside the session (background)
+  vnc [PORT]              export the display over VNC for live viewing (default 5999)
+
+State lives in $STATE (override with NOIR_XVFB_STATE); binaries are taken
+from $BUILD (override with NOIR_BUILD_DIR).
+EOF
+}
+
+die() { echo "noir-xvfb: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+alive() {
+    local pid
+    [[ -s $STATE/$1.pid ]] && pid=$(<"$STATE/$1.pid") && kill -0 "$pid" 2>/dev/null
+}
+
+# Start a detached process group so it outlives this script; record its pid.
+launch() {
+    local name=$1; shift
+    setsid "$@" >>"$STATE/$name.log" 2>&1 </dev/null &
+    echo $! >"$STATE/$name.pid"
+    disown
+}
+
+terminate() {
+    local name=$1 pid
+    [[ -s $STATE/$name.pid ]] || return 0
+    pid=$(<"$STATE/$name.pid")
+    # Processes are session leaders (setsid): signal the whole group.
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    rm -f "$STATE/$name.pid"
+}
+
+# wait_for SECONDS DESCRIPTION COMMAND...
+wait_for() {
+    local seconds=$1 what=$2; shift 2
+    for ((i = 0; i < seconds * 10; i++)); do
+        "$@" >/dev/null 2>&1 && return 0
+        sleep 0.1
+    done
+    echo "noir-xvfb: timed out waiting for $what" >&2
+    return 1
+}
+
+# Point this process at the harness session and strip everything the host
+# desktop session leaked into the environment.
+session_env() {
+    alive xvfb || die "no session running (start one with: noir-xvfb start)"
+    unset WAYLAND_DISPLAY SESSION_MANAGER DESKTOP_SESSION XDG_SESSION_DESKTOP \
+          KDE_FULL_SESSION KDE_SESSION_VERSION KDE_SESSION_UID \
+          QT_QPA_PLATFORMTHEME QT_SCALE_FACTOR QT_SCREEN_SCALE_FACTORS \
+          QT_IM_MODULE GTK_IM_MODULE XMODIFIERS QSG_RHI_BACKEND
+    export DISPLAY=":$(<"$STATE/display")"
+    export DBUS_SESSION_BUS_ADDRESS="$(<"$STATE/bus.addr")"
+    export XDG_CURRENT_DESKTOP=Noir XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb
+    # Xvfb has no GPU: have Mesa go straight to llvmpipe.
+    export LIBGL_ALWAYS_SOFTWARE=1
+    # Without a terminal Qt would send its messages to the journal, not the log.
+    export QT_FORCE_STDERR_LOGGING=1
+}
+
+debug_call() {
+    local method=$1; shift
+    dbus-send --session --print-reply=literal --dest=$DEBUG_SERVICE /Debug "$DEBUG_IFACE.$method" "$@" \
+        | sed '1s/^   //'
+}
+
+debug_ready() { dbus-send --session --print-reply --dest=$DEBUG_SERVICE /Debug "$DEBUG_IFACE.Windows"; }
+
+xinject() {
+    [[ -x $XINJECT_BIN ]] || die "noir-xinject is not built (needs libXtst headers): cmake --build $BUILD --target noir-xinject"
+    "$XINJECT_BIN" "$@"
+}
+
+start_shell() {
+    local -a cmd
+    # shellcheck disable=SC1091
+    source "$STATE/shell.cmd"
+    : >"$STATE/shell.log"
+    launch shell "${cmd[@]}"
+    if ! wait_for 30 "the shell debug interface" shell_up; then
+        echo "--- last lines of $STATE/shell.log" >&2
+        tail -n 25 "$STATE/shell.log" >&2
+        return 1
+    fi
+}
+
+# Succeeds once the debug interface answers; gives up early if the shell died.
+shell_up() { alive shell || return 0; debug_ready; }
+
+cmd_start() {
+    local size=1280x720 display="" backend="" demo=0 windowed="" wm=1 wm_cmd="" wrap="" compositor=0
+    while (($#)); do
+        case $1 in
+            --size) size=$2; shift 2 ;;
+            --display) display=${2#:}; shift 2 ;;
+            --backend) backend=$2; shift 2 ;;
+            --demo) demo=1; shift ;;
+            --windowed)
+                if [[ ${2:-} =~ ^[0-9]+x[0-9]+$ ]]; then windowed=$2; shift 2; else windowed=auto; shift; fi ;;
+            --no-wm) wm=0; shift ;;
+            --compositor) compositor=1; shift ;;
+            --wm) wm_cmd=$2; shift 2 ;;
+            --wrap) wrap=$2; shift 2 ;;
+            *) die "start: unknown option $1" ;;
+        esac
+    done
+    [[ $size =~ ^[0-9]+x[0-9]+$ ]] || die "start: --size expects WxH"
+    [[ $windowed == auto ]] && windowed=$size
+
+    alive xvfb && die "a session is already running on :$(<"$STATE/display") (noir-xvfb stop)"
+    need Xvfb; need dbus-daemon; need dbus-send; need xprop
+    [[ -x $SHELL_BIN ]] || die "$SHELL_BIN not found; build first: cmake -B $BUILD -S $REPO && cmake --build $BUILD"
+    if ((wm)) && [[ -z $wm_cmd ]]; then
+        [[ -x $WM_BIN ]] || die "$WM_BIN not found; build it or pass --no-wm / --wm"
+        wm_cmd="$WM_BIN --no-compositor"
+        ((compositor)) && wm_cmd="$WM_BIN"
+    fi
+
+    mkdir -p "$STATE/shots"
+    rm -f "$STATE"/*.pid "$STATE"/*.log "$STATE/display" "$STATE/bus.addr"
+
+    # X server. -displayfd doubles as the readiness signal.
+    if [[ -n $display ]]; then
+        launch xvfb Xvfb ":$display" -screen 0 "${size}x24" -nolisten tcp
+        echo "$display" >"$STATE/display"
+        DISPLAY=":$display" wait_for 10 "Xvfb" xprop -root -len 0 _NET_SUPPORTED || { cmd_stop; exit 1; }
+    else
+        launch xvfb Xvfb -displayfd 3 -screen 0 "${size}x24" -nolisten tcp 3>"$STATE/display"
+        wait_for 10 "Xvfb" test -s "$STATE/display" || { tail -n 5 "$STATE/xvfb.log" >&2; cmd_stop; exit 1; }
+    fi
+
+    # Private session bus with no service activation, so nothing from the host
+    # session (portals, gvfs, the real notification daemon) gets involved.
+    cat >"$STATE/bus.conf" <<'EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+    launch dbus dbus-daemon --config-file="$STATE/bus.conf" --nofork --print-address=3 3>"$STATE/bus.addr"
+    wait_for 10 "dbus-daemon" test -s "$STATE/bus.addr" || { tail -n 5 "$STATE/dbus.log" >&2; cmd_stop; exit 1; }
+
+    session_env
+
+    if [[ -n $wm_cmd ]]; then
+        # shellcheck disable=SC2086
+        launch wm $wm_cmd
+        wait_for 10 "the window manager" wm_ready || { tail -n 10 "$STATE/wm.log" >&2; cmd_stop; exit 1; }
+    fi
+
+    local -a cmd=()
+    # shellcheck disable=SC2206
+    [[ -n $wrap ]] && cmd=($wrap)
+    cmd+=("$SHELL_BIN" --debug-interface)
+    ((demo)) && cmd+=(--demo)
+    [[ -n $windowed ]] && cmd+=(--windowed "$windowed")
+    [[ -n $backend ]] && cmd+=(--backend "$backend")
+    declare -p cmd >"$STATE/shell.cmd"
+    start_shell || { cmd_stop; exit 1; }
+    alive shell || { echo "noir-xvfb: the shell exited during startup:" >&2; tail -n 25 "$STATE/shell.log" >&2; cmd_stop; exit 1; }
+
+    echo "Noir session running on DISPLAY=$DISPLAY (${size}), state in $STATE"
+    echo "Try: noir-xvfb status | shot | tree | logs"
+}
+
+wm_ready() { xprop -root _NET_SUPPORTING_WM_CHECK | grep -q 'window id'; }
+
+cmd_stop() {
+    local name
+    for name in vnc shell wm dbus xvfb; do terminate "$name"; done
+    rm -f "$STATE/display" "$STATE/bus.addr"
+}
+
+cmd_reload() {
+    session_env
+    if [[ ${1:-} != --no-build ]]; then
+        cmake --build "$BUILD" --target NoirShell
+    fi
+    terminate shell
+    start_shell
+    alive shell || { tail -n 25 "$STATE/shell.log" >&2; die "the shell exited during startup"; }
+    echo "shell restarted (pid $(<"$STATE/shell.pid"))"
+}
+
+cmd_status() {
+    if ! alive xvfb; then
+        echo "no session running"
+        return 1
+    fi
+    session_env
+    echo "display  $DISPLAY  $(xprop -root _NET_DESKTOP_GEOMETRY 2>/dev/null | sed 's/.*= //; s/, /x/')"
+    echo "bus      $DBUS_SESSION_BUS_ADDRESS"
+    local name
+    for name in xvfb dbus wm shell vnc; do
+        [[ -e $STATE/$name.pid ]] || continue
+        if alive "$name"; then printf '%-8s pid %s\n' "$name" "$(<"$STATE/$name.pid")"
+        else printf '%-8s DEAD (see noir-xvfb logs %s)\n' "$name" "$name"; fi
+    done
+    echo
+    xprop -root _NET_WORKAREA _NET_ACTIVE_WINDOW _NET_CLIENT_LIST_STACKING 2>/dev/null || true
+    if command -v wmctrl >/dev/null 2>&1; then
+        echo
+        echo "wm       $(wmctrl -m 2>/dev/null | sed -n 's/^Name: //p')"
+        wmctrl -l 2>/dev/null || true
+    fi
+    if alive shell; then
+        echo
+        echo "shell surfaces:"
+        debug_call Windows 2>/dev/null || echo "  (debug interface not answering)"
+    fi
+}
+
+cmd_shot() {
+    session_env
+    need import
+    local file=${1:-$STATE/shots/screen-$(date +%H%M%S).png}
+    import -window root "$file"
+    echo "$file"
+}
+
+cmd_grab() {
+    session_env
+    (($# >= 1)) || die "grab: expected WINDOW [FILE]"
+    local file=${2:-$STATE/shots/grab-$(date +%H%M%S).png} error
+    file=$(realpath -m "$file")
+    error=$(debug_call Grab "string:$1" "string:$file")
+    [[ -z $error ]] || die "grab: $error"
+    echo "$file"
+}
+
+cmd_tree() {
+    session_env
+    local window="" visible=true
+    while (($#)); do
+        case $1 in
+            --all) visible=false ;;
+            *) window=$1 ;;
+        esac
+        shift
+    done
+    debug_call ItemTree "string:$window" "boolean:$visible"
+}
+
+cmd_click() {
+    session_env
+    (($# >= 1)) || die "click: expected X Y or @PATTERN"
+    if [[ $1 == @* ]]; then
+        local pattern=${1#@} tree line
+        tree=$(debug_call ItemTree string: boolean:true | grep -v '^0x')
+        line=$(grep -E -i -m 1 -- "$pattern" <<<"$tree") || die "click: no visible item matches \"$pattern\""
+        [[ $line =~ \ (-?[0-9]+),(-?[0-9]+)\ ([0-9]+)x([0-9]+) ]] || die "click: cannot parse: $line"
+        local x=$((BASH_REMATCH[1] + BASH_REMATCH[3] / 2)) y=$((BASH_REMATCH[2] + BASH_REMATCH[4] / 2))
+        echo "click $x $y  <- $(sed 's/^ *//' <<<"$line")"
+        xinject click "$x" "$y" "${@:2}"
+    else
+        xinject click "$@"
+    fi
+}
+
+cmd_notify() {
+    session_env
+    (($# >= 1)) || die "notify: expected SUMMARY [BODY]"
+    # The hints argument is a{sv}, which dbus-send cannot express.
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a noir-xvfb "$1" "${2:-}"
+    else
+        need gdbus
+        gdbus call --session --dest org.freedesktop.Notifications \
+            --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.Notify \
+            noir-xvfb 0 "" "$1" "${2:-}" "[]" "{}" -- -1 >/dev/null
+    fi
+}
+
+cmd_logs() {
+    local name=shell follow=0
+    while (($#)); do
+        case $1 in
+            -f) follow=1 ;;
+            *) name=$1 ;;
+        esac
+        shift
+    done
+    [[ -e $STATE/$name.log ]] || die "logs: no $name log in $STATE"
+    if ((follow)); then exec tail -n 50 -f "$STATE/$name.log"; fi
+    tail -n 50 "$STATE/$name.log"
+}
+
+cmd_vnc() {
+    session_env
+    need x0vncserver
+    local port=${1:-5999}
+    alive vnc && die "VNC is already exported (noir-xvfb status)"
+    : >"$STATE/vnc.log"
+    launch vnc x0vncserver -display "$DISPLAY" -SecurityTypes None -localhost -rfbport "$port"
+    sleep 0.5
+    alive vnc || { tail -n 5 "$STATE/vnc.log" >&2; die "x0vncserver failed to start"; }
+    echo "VNC on localhost:$port (no password, loopback only). View with: vncviewer localhost::$port"
+}
+
+# --- smoke test ---------------------------------------------------------------
+
+smoke_failures=0
+check() {
+    local what=$1; shift
+    if "$@" >/dev/null 2>&1; then echo "  ok    $what"
+    else echo "  FAIL  $what"; smoke_failures=$((smoke_failures + 1)); fi
+}
+eval_is() { [[ $(debug_call Eval "string:$1") == "$2" ]]; }
+# X11 id of the client window whose WM_CLASS instance is $1.
+client_id() { wmctrl -l -x | awk -v name="$1" '$3 ~ "^" name "\\." { print $1; found = 1 } END { exit !found }'; }
+
+cmd_smoke() {
+    [[ -n ${NOIR_XVFB_STATE:-} ]] || STATE=$BUILD/xvfb-smoke
+    alive xvfb && cmd_stop
+    trap cmd_stop EXIT
+    cmd_start --demo "$@" >/dev/null
+    session_env
+
+    local surfaces
+    surfaces=$(debug_call Windows)
+    check "desktop surface is mapped" grep -q 'visible.*"Noir Desktop"' <<<"$surfaces"
+    check "taskbar surface is mapped" grep -q 'visible.*"Noir Taskbar"' <<<"$surfaces"
+    check "window manager is NoirWM" eval '[[ $(wmctrl -m) == *NoirWM* ]]'
+    check "taskbar strut shrinks the work area" eval \
+        '[[ $(xprop -root _NET_WORKAREA) =~ ,\ ([0-9]+)$ ]] && (( BASH_REMATCH[1] < $(xprop -root _NET_DESKTOP_GEOMETRY | sed "s/.*, //") ))'
+    check "demo tasks are listed" eval_is "shell.tasks.count" 3
+    local tree
+    tree=$(debug_call ItemTree string:Taskbar boolean:true)
+    check "item tree contains the taskbar" grep -q '^ *Taskbar' <<<"$tree"
+
+    cmd_notify "Smoke test" "Sent over org.freedesktop.Notifications" >/dev/null
+    check "notification reaches the shell" wait_for 5 "notification" eval_is \
+        "NotificationServer.count > 0" true
+
+    if [[ -x $XINJECT_BIN ]]; then
+        cmd_click '@toolTip="Applications"' >/dev/null
+        check "clicking the start button opens the start menu" wait_for 5 "start menu" eval_is \
+            "shell.startMenuOpen" true
+        sleep 0.5
+    else
+        echo "  skip  input injection (noir-xinject not built)"
+    fi
+
+    # Window decorations, with a real client if one is installed.
+    if command -v xclock >/dev/null 2>&1 && command -v wmctrl >/dev/null 2>&1; then
+        setsid xclock -name smoke-clock >>"$STATE/clients.log" 2>&1 </dev/null &
+        check "a client window gets mapped" wait_for 5 "xclock" client_id smoke-clock
+        local client
+        client=$(client_id smoke-clock || true)
+        check "NoirWM frames it with a title bar" eval \
+            '[[ $(xprop -id "$client" _NET_FRAME_EXTENTS) == *"= 4, 4, 28, 4" ]]'
+        if [[ -x $XINJECT_BIN ]]; then
+            xinject key Escape alt+F10
+            check "Alt+F10 maximizes it" wait_for 3 "maximize" eval \
+                '[[ $(xprop -id "$client" _NET_WM_STATE) == *MAXIMIZED_VERT* ]]'
+            sleep 0.3
+            cmd_shot "$STATE/shots/smoke-window.png" >/dev/null
+            xinject key alt+F4
+            check "Alt+F4 closes it" wait_for 3 "close" eval '! client_id smoke-clock'
+        fi
+    else
+        echo "  skip  window decorations (needs xclock and wmctrl)"
+    fi
+
+    echo "  shot  $(cmd_shot "$STATE/shots/smoke.png")"
+    if ((smoke_failures)); then
+        echo "smoke test: $smoke_failures check(s) failed; logs in $STATE"
+        exit 1
+    fi
+    echo "smoke test passed"
+}
+
+# --- dispatch -----------------------------------------------------------------
+
+command=${1:-help}
+shift || true
+case $command in
+    start) cmd_start "$@" ;;
+    stop) cmd_stop ;;
+    reload) cmd_reload "$@" ;;
+    status) cmd_status ;;
+    smoke) cmd_smoke "$@" ;;
+    shot) cmd_shot "$@" ;;
+    grab) cmd_grab "$@" ;;
+    windows) session_env; debug_call Windows ;;
+    tree) cmd_tree "$@" ;;
+    eval) session_env; (($# == 1)) || die "eval: expected one expression"; echo "$(debug_call Eval "string:$1")" ;;
+    logs) cmd_logs "$@" ;;
+    env)
+        session_env
+        echo "export DISPLAY=$DISPLAY"
+        echo "export DBUS_SESSION_BUS_ADDRESS='$DBUS_SESSION_BUS_ADDRESS'"
+        echo "export LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb QT_FORCE_STDERR_LOGGING=1" ;;
+    click) cmd_click "$@" ;;
+    move | drag | scroll | key | type) session_env; xinject "$command" "$@" ;;
+    notify) cmd_notify "$@" ;;
+    run) session_env; (($#)) || die "run: expected a command"; exec "$@" ;;
+    spawn)
+        session_env
+        (($#)) || die "spawn: expected a command"
+        setsid "$@" >>"$STATE/clients.log" 2>&1 </dev/null &
+        echo "started $1 (pid $!), output in $STATE/clients.log" ;;
+    vnc) cmd_vnc "$@" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac
