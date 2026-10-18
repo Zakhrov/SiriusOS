@@ -490,6 +490,7 @@ void frame_handle_button_release(NoirWM* wm, XButtonEvent* event) {
 }
 
 static void drag_update(NoirWM* wm, NoirClient* c, int rootX, int rootY) {
+    const int previousX = c->x, previousY = c->y;
     const int dx = rootX - wm->dragStartX, dy = rootY - wm->dragStartY;
     long area[4];
     wm_get_workarea(wm, area);
@@ -513,6 +514,9 @@ static void drag_update(NoirWM* wm, NoirClient* c, int rootX, int rootY) {
     const int maxY = (int)(area[1] + area[3]) - FRAME_TITLE;
     if (c->y > maxY) c->y = maxY;
     if (c->y < area[1]) c->y = (int)area[1];
+    if (wm->compositor && wm->dragMode == DRAG_MOVE)
+        compositor_move(wm->compositor, c->frame, c->x - previousX, c->y - previousY,
+                        wm->dragStartX - wm->dragX, wm->dragStartY - wm->dragY);
     frame_apply_geometry(wm, c);
     if (wm->dragMode == DRAG_RESIZE) {
         frame_draw(wm, c);

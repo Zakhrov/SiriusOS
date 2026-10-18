@@ -23,6 +23,15 @@ uint8_t* renderer_texture_pixels(RendererTexture* texture);
 void renderer_texture_update(VulkanRenderer* renderer, RendererTexture* texture,
                              int x, int y, int width, int height);
 
+// Queue before begin_frame; a compute dispatch builds each mesh before drawing.
+// Kinds: 1 = wobble, 2 = lamp (progress 0 open .. 1 minimized), 3 = shatter.
+int renderer_prepare_effect(VulkanRenderer* renderer, RendererTexture* texture,
+                            int x, int y, int width, int height, int hasAlpha,
+                            int kind, float progress, float seed,
+                            const float target[4], const float motion[4]);
+void renderer_draw_effect(VulkanRenderer* renderer, RendererTexture* texture);
+int renderer_effects_supported(const VulkanRenderer* renderer);
+
 // A frame is begin, any number of draws (painted in call order), end.
 // begin returns 0 when no image could be acquired; skip the frame then.
 // `offscreen` asks for a frame that can blur (see renderer_draw_blur).

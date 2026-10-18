@@ -1,6 +1,7 @@
 #include "Client.h"
 #include "Ewmh.h"
 #include "Frame.h"
+#include "Compositor.h"
 
 #include <X11/Xutil.h>
 #include <stdlib.h>
@@ -260,6 +261,8 @@ void client_unmanage(NoirWM* wm, Window window) {
         }
         const int hadStrut = wm->clients[i].strut[0] || wm->clients[i].strut[1] ||
                              wm->clients[i].strut[2] || wm->clients[i].strut[3];
+        if (wm->compositor && !wm->clients[i].isShellSurface && !wm->clients[i].minimized)
+            compositor_close(wm->compositor, client_toplevel(&wm->clients[i]));
         frame_destroy(wm, &wm->clients[i]);
         if (wm->dragClient == window) {
             wm->dragMode = DRAG_NONE;
@@ -312,6 +315,8 @@ static void send_protocol(NoirWM* wm, Window window, Atom protocol) {
 void client_activate(NoirWM* wm, NoirClient* client) {
     Display* d = wm->display;
     if (client->minimized) {
+        if (wm->compositor && !client->isShellSurface)
+            compositor_minimize(wm->compositor, client_toplevel(client), client->window, 0);
         client->minimized = 0;
         XMapWindow(d, client_toplevel(client));
         set_wm_state(wm, client->window, NormalState);
@@ -337,6 +342,8 @@ void client_minimize(NoirWM* wm, NoirClient* client) {
         return;
     }
     // Mark first: the UnmapNotify this causes must not unmanage the window.
+    if (wm->compositor && !client->isShellSurface)
+        compositor_minimize(wm->compositor, client_toplevel(client), client->window, 1);
     client->minimized = 1;
     XUnmapWindow(wm->display, client_toplevel(client));
     set_wm_state(wm, client->window, IconicState);

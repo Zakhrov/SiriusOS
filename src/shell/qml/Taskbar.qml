@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import Noir.Shell
 import Noir.Ui
 
@@ -68,6 +69,32 @@ FocusScope {
         KeyNavigation.left: start
 
         delegate: TaskButton {
+            id: taskTile
+            function publishGeometry() {
+                if (!taskbar || !taskbar.tasks)
+                    return
+                const shown = visible && x >= 0 && x + width <= taskList.width
+                taskbar.tasks.setIconGeometry(index, shown ? taskTile : null)
+            }
+            Component.onCompleted: Qt.callLater(publishGeometry)
+            onXChanged: Qt.callLater(publishGeometry)
+            onYChanged: Qt.callLater(publishGeometry)
+            onWidthChanged: Qt.callLater(publishGeometry)
+            onHeightChanged: Qt.callLater(publishGeometry)
+            onVisibleChanged: Qt.callLater(publishGeometry)
+            Connections {
+                target: taskList
+                function onXChanged() { Qt.callLater(taskTile.publishGeometry) }
+                function onYChanged() { Qt.callLater(taskTile.publishGeometry) }
+                function onWidthChanged() { Qt.callLater(taskTile.publishGeometry) }
+            }
+            Connections {
+                target: taskTile.Window.window
+                function onXChanged() { Qt.callLater(taskTile.publishGeometry) }
+                function onYChanged() { Qt.callLater(taskTile.publishGeometry) }
+                function onVisibleChanged() { Qt.callLater(taskTile.publishGeometry) }
+                function onScreenChanged() { Qt.callLater(taskTile.publishGeometry) }
+            }
             title: model.title
             windowIcon: model.iconSource
             active: model.active

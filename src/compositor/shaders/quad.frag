@@ -7,11 +7,15 @@ layout(push_constant) uniform Push {
     float mode;
     float opacity;
     vec4 uvRect;
+    vec4 effect;
+    vec4 target;
+    vec4 motion;
 } pc;
 
 layout(set = 0, binding = 0) uniform sampler2D windowTexture;
 
 layout(location = 0) in vec2 uv;
+layout(location = 1) in vec2 shade;
 layout(location = 0) out vec4 color;   // premultiplied alpha
 
 void main() {
@@ -30,5 +34,6 @@ void main() {
     if (pc.mode < 0.5) {
         texel.a = 1.0;   // depth-24 windows carry garbage in the alpha byte
     }
-    color = texel * pc.opacity;
+    texel.rgb = mix(texel.rgb, vec3(texel.a), shade.y);
+    color = texel * (pc.opacity * shade.x);
 }

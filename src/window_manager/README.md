@@ -9,7 +9,7 @@ This repository contains the source code for the SiriusOS Noir Desktop Environme
 - Vulkan SDK (headers, loader and `glslangValidator`)
 - X11 development libraries, including Xft, Xcomposite, Xdamage, Xfixes and Xext
 - CMake
-- A C compiler (e.g., GCC or Clang)
+- C and C++ compilers (e.g., GCC or Clang), Qt 6 Core (motion preferences)
 - Make/Ninja
 
 ### Build Instructions
@@ -114,6 +114,54 @@ drawn to the swapchain. Frames without blur skip all of it. It needs the
 output format to support linear blits (any GPU, and lavapipe);
 `NOIR_NO_BLUR=1` turns it off.
 
+### Window effects
+
+With compositing enabled, normal application windows get:
+
+- **Wobbly movement**: dragging the title bar pulls a deformable mesh behind
+  the pointer's grab point. A damped spring settles it after movement stops;
+  the real window geometry and input handling still update immediately.
+- **Magic-lamp minimize / restore**: a curved neck narrows the window into its
+  taskbar button, then drains it away. Restoring runs the same deformation in
+  reverse. Repeated toggles reverse from the current shape rather than
+  restarting. NoirShell publishes `_NET_WM_ICON_GEOMETRY` for visible task
+  buttons; without a valid target the lamp drains to the bottom screen edge.
+- **Shattering-glass close**: the last composited contents break into
+  irregular triangular shards which spin, catch silver highlights, fall and
+  fade. The snapshot survives the X window's destruction at its original
+  stacking position. This starts on actual withdrawal/destruction, not on a
+  close request, so an application's confirmation dialog is not shattered
+  prematurely.
+
+Minimize changes ICCCM/EWMH state and unmaps the real window immediately;
+only its retained texture continues drawing. Effects do not apply to desktop,
+dock, notification or menu surfaces. Maximize keeps its existing immediate
+geometry change.
+
+The effects shader is compiled to SPIR-V and generates a 24-by-16 triangle
+mesh per animated window in a batched compute phase, followed by a
+compute-to-vertex shader memory barrier. Compute and graphics share the
+existing presentation queue to avoid cross-queue ownership transfers for
+these small meshes. Devices whose presentation queue lacks compute retain
+ordinary compositing with effects disabled and a diagnostic.
+
+Control Center's **Appearance > Reduce Motion** disables these effects and
+finishes in-flight transitions; **animation speed** scales their duration.
+The compositor reads the same `SiriusOS/Noir.ini` preferences as the shell,
+including changes during an animation. Settled windows use the original
+pixel-exact quad path, and completed effects stop requesting frames.
+Without a compositor all window actions remain immediate.
+
+The isolated pixel-level regression test needs Xvfb and a presenting Vulkan
+driver (Mesa's GPU and lavapipe drivers both work):
+
+```bash
+cmake --build build --target noir-compositor-effects-test
+ctest --test-dir build -R '^noir-compositor-effects$' --output-on-failure
+# Optional: enable the installed Vulkan validation layer as well.
+NOIR_VK_VALIDATION=1 ctest --test-dir build -R '^noir-compositor-effects$' --output-on-failure
+```
+
 Window contents travel through the CPU, which is simple and driver
 independent but not free; a zero-copy path (DRI3 pixmaps imported as
 dma-bufs) is the natural next step for hardware drivers.
@@ -138,11 +186,12 @@ that taskbars and pagers rely on. Everything listed here is advertised in
 | Maximize | `_NET_WM_STATE_MAXIMIZED_VERT` / `_HORZ` (always both together), also honoured when set before mapping |
 | Frames | Title bar and borders reported in `_NET_FRAME_EXTENTS` (4, 4, 28, 4); `_NET_REQUEST_FRAME_EXTENTS`; `_NET_WM_ALLOWED_ACTIONS`; `_NET_WM_STATE_FOCUSED` |
 | Compositing | `_NET_WM_CM_S0` selection owned while the compositor runs |
+| Animation target | `_NET_WM_ICON_GEOMETRY` supplies the magic-lamp destination |
 
 Docks only take focus when a pager/taskbar asks (source indication 2), so
 clicking the taskbar never makes it the active window.
 
 Not implemented yet: multiple desktops (the 3D cube), fullscreen,
 `_NET_WM_MOVERESIZE` / `_NET_MOVERESIZE_WINDOW`, `_NET_WM_PING`,
-`_NET_WM_USER_TIME` focus-stealing prevention, and the VDD's window
-animations (wobble, magic lamp, shatter, flip switcher).
+`_NET_WM_USER_TIME` focus-stealing prevention, the magic-lamp maximize
+transition, and the VDD's flip switcher.

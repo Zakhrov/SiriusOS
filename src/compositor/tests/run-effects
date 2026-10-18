@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+state=$(mktemp -d)
+xvfb_pid=
+cleanup() {
+    if [[ -n $xvfb_pid ]]; then
+        kill "$xvfb_pid" 2>/dev/null || true
+        wait "$xvfb_pid" 2>/dev/null || true
+    fi
+    rm -f "$state/display" "$state/xvfb.log" "$state/config/SiriusOS/Noir.ini"
+    rmdir "$state/config/SiriusOS" "$state/config" "$state"
+}
+trap cleanup EXIT
+mkdir -p "$state/config/SiriusOS"
+Xvfb -displayfd 3 -screen 0 640x480x24 -nolisten tcp 3>"$state/display" >"$state/xvfb.log" 2>&1 &
+xvfb_pid=$!
+for ((i = 0; i < 100; i++)); do
+    [[ -s $state/display ]] && break
+    kill -0 "$xvfb_pid" 2>/dev/null || { cat "$state/xvfb.log"; exit 1; }
+    sleep 0.05
+done
+[[ -s $state/display ]] || { echo "Xvfb did not become ready" >&2; exit 1; }
+export DISPLAY=":$(<"$state/display")"
+export XDG_CONFIG_HOME="$state/config"
+export MESA_VK_WSI_DEBUG=sw
+"$1"

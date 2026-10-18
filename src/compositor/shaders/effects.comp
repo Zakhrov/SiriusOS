@@ -1,0 +1,87 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform Push {
+    vec4 rect;
+    vec4 params;
+    vec2 screen;
+    float mode;
+    float opacity;
+    vec4 uvRect;
+    vec4 effect;   // kind (1 wobble, 2 lamp, 3 shatter), progress, mesh slot, seed
+    vec4 target;
+    vec4 motion;   // displacement xy, grab point zw
+} pc;
+
+struct Vertex { vec4 positionUv; vec4 shade; };
+layout(std430, set = 1, binding = 0) writeonly buffer Mesh { Vertex vertices[]; };
+const uvec2 grid = uvec2(24, 16);
+const uint vertexCount = 24 * 16 * 6;
+
+float random(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7)) + pc.effect.w) * 43758.5453);
+}
+
+vec2 point(uvec2 p, bool jitter) {
+    vec2 q = vec2(p);
+    if (jitter && p.x > 0 && p.x < grid.x && p.y > 0 && p.y < grid.y)
+        q += (vec2(random(q), random(q + 31.0)) - 0.5) * 0.7;
+    return q / vec2(grid);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= vertexCount) return;
+    uint cell = i / 6;
+    uint corner = i % 6;
+    uvec2 origin = uvec2(cell % grid.x, cell / grid.x);
+    const uvec2 corners[6] = uvec2[6](
+        uvec2(0, 0), uvec2(1, 0), uvec2(1, 1),
+        uvec2(0, 0), uvec2(1, 1), uvec2(0, 1));
+    bool shatter = pc.effect.x > 2.5;
+    vec2 uv = point(origin + corners[corner], shatter);
+    vec2 pixel = pc.rect.xy + uv * pc.rect.zw;
+    float alpha = 1.0;
+    float glint = 0.0;
+    float t = pc.effect.y;
+    if (pc.effect.x < 1.5) {
+        vec2 distanceFromGrab = uv - pc.motion.zw;
+        float weight = min(length(distanceFromGrab) * 1.3, 1.5);
+        pixel += pc.motion.xy * weight;
+        pixel.x += pc.motion.y * sin(uv.y * 3.141593) * 0.15;
+        pixel.y += pc.motion.x * sin(uv.x * 3.141593) * 0.10;
+    } else if (!shatter) {
+        // Narrow into a curved neck first; only then drain into the task tile.
+        float neck = smoothstep(0.0, 0.65, t);
+        float drain = smoothstep(0.28, 1.0, t);
+        vec2 destination = pc.target.xy + uv * pc.target.zw;
+        float along = uv.y;
+        float taper = neck * (0.15 + 0.85 * along * along);
+        pixel.x = mix(pixel.x, destination.x, taper);
+        pixel.x += sin(along * 3.141593) * sin(t * 3.141593)
+                 * (pc.target.x + pc.target.z * 0.5 - (pc.rect.x + pc.rect.z * 0.5)) * 0.18;
+        pixel = mix(pixel, destination, drain);
+        alpha = 1.0 - smoothstep(0.88, 1.0, t);
+    } else {
+        uint tri = corner < 3 ? 0 : 3;
+        vec2 center = (point(origin + corners[tri], true)
+                     + point(origin + corners[tri + 1], true)
+                     + point(origin + corners[tri + 2], true)) / 3.0;
+        float seed = random(vec2(cell, tri));
+        vec2 local = (uv - center) * pc.rect.zw;
+        float angle = (seed - 0.5) * t * 12.0;
+        local = mat2(cos(angle), -sin(angle), sin(angle), cos(angle)) * local;
+        float tilt = cos(t * (4.0 + seed * 8.0));
+        local.x *= tilt;
+        float perspective = 1.0 / (1.0 + t * (0.2 + seed * 0.8));
+        vec2 velocity = (center - 0.5) * vec2(320.0, 180.0);
+        velocity += vec2((seed - 0.5) * 180.0, -80.0 - seed * 120.0);
+        pixel = pc.rect.xy + center * pc.rect.zw + local * perspective
+              + velocity * t + vec2(0.0, 480.0 * t * t);
+        alpha = 1.0 - smoothstep(0.35, 1.0, t);
+        glint = pow(1.0 - abs(tilt), 8.0) * sin(t * 3.141593) * 0.55;
+    }
+    uint index = uint(pc.effect.z) * vertexCount + i;
+    vertices[index].positionUv = vec4(pixel, uv);
+    vertices[index].shade = vec4(alpha, glint, 0.0, 0.0);
+}

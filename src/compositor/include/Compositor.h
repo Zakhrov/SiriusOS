@@ -25,4 +25,9 @@ void compositor_draw(NoirCompositor* compositor);
 
 // Give a top-level window (a child of the root) a drop shadow.
 void compositor_set_shadow(NoirCompositor* compositor, Window toplevel, int enabled);
+// WM lifecycle hooks: called before unmap/map and before destroying a frame.
+void compositor_minimize(NoirCompositor* compositor, Window toplevel, Window client, int minimized);
+void compositor_close(NoirCompositor* compositor, Window toplevel);
+// Actual drag displacement, with the pointer's grab point in window coordinates.
+void compositor_move(NoirCompositor* compositor, Window toplevel, int dx, int dy, int grabX, int grabY);
 const char* compositor_device_name(const NoirCompositor* compositor);

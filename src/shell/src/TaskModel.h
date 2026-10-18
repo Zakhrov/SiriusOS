@@ -4,6 +4,7 @@
 #include <QAbstractNativeEventFilter>
 #include <QQmlEngine>
 #include <QQuickImageProvider>
+#include <QQuickItem>
 #include <QTimer>
 
 #include <xcb/xcb.h>
@@ -42,6 +43,7 @@ public:
     Q_INVOKABLE void close(int row);
     // Taskbar click semantics: minimize the active window, otherwise raise it.
     Q_INVOKABLE void toggle(int row);
+    Q_INVOKABLE void setIconGeometry(int row, QQuickItem *item);
 
     bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override;
 
@@ -57,6 +59,7 @@ private:
         bool attention = false;
         bool skip = false;
         int iconSerial = 0;
+        QRect iconGeometry;
     };
 
     void scheduleRefresh();

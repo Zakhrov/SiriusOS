@@ -11,11 +11,14 @@
 
 #include "shaders/quad_vert.h"
 #include "shaders/quad_frag.h"
+#include "shaders/effects_comp.h"
 
 #define TEXTURE_FORMAT VK_FORMAT_B8G8R8A8_UNORM   // X11 ZPixmap byte order
 #define MAX_TEXTURES 1024
 #define BLUR_LEVELS 4        // 1/2 .. 1/16 of the screen
 #define BLUR_MARGIN 64       // pixels around a blurred area that feed into it
+#define MAX_EFFECTS 64
+#define EFFECT_VERTICES (24 * 16 * 6)
 
 struct RendererTexture {
     int width, height;
@@ -23,6 +26,7 @@ struct RendererTexture {
     VkDeviceMemory imageMemory;
     VkImageView view;
     VkDescriptorSet descriptor;
+    VkDescriptorSet effectDescriptor;
     VkBuffer staging;
     VkDeviceMemory stagingMemory;
     uint8_t* pixels;          // staging memory, mapped for the texture's lifetime
@@ -38,6 +42,9 @@ typedef struct {
     float mode;
     float opacity;
     float uvRect[4];
+    float effect[4];
+    float target[4];
+    float motion[4];
 } PushConstants;
 
 // A screen-sized image the compositor renders or blurs into.
@@ -71,6 +78,17 @@ struct VulkanRenderer {
     VkDescriptorPool descriptorPool;
     VkPipelineLayout pipelineLayout;
     VkPipeline pipeline;
+    int effectsSupported;
+    VkPipeline computePipeline;
+    VkDescriptorSetLayout meshLayout;
+    VkDescriptorSet meshDescriptor;
+    VkBuffer meshBuffer;
+    VkDeviceMemory meshMemory;
+    struct {
+        RendererTexture* texture;
+        PushConstants push;
+    } effects[MAX_EFFECTS];
+    int effectCount;
     VkSampler sampler;
     VkCommandPool commandPool;
     VkCommandBuffer commandBuffer;
@@ -150,6 +168,18 @@ static int pick_device(VulkanRenderer* r) {
 }
 
 static int create_device(VulkanRenderer* r) {
+    uint32_t familyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(r->physicalDevice, &familyCount, NULL);
+    VkQueueFamilyProperties* families = calloc(familyCount, sizeof(*families));
+    if (!families) {
+        fprintf(stderr, "NoirCompositor: cannot query compute support\n");
+        return 0;
+    }
+    vkGetPhysicalDeviceQueueFamilyProperties(r->physicalDevice, &familyCount, families);
+    r->effectsSupported = (families[r->queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+    free(families);
+    if (!r->effectsSupported)
+        fprintf(stderr, "NoirCompositor: window effects off (presentation queue lacks compute)\n");
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                           .queueFamilyIndex = r->queueFamily,
@@ -454,11 +484,14 @@ static int create_pipeline(VulkanRenderer* r) {
     CHECK(vkCreateDescriptorSetLayout(r->device, &layoutInfo, NULL, &r->descriptorLayout),
           "cannot create the descriptor layout");
 
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_TEXTURES };
+    VkDescriptorPoolSize poolSizes[] = {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_TEXTURES * 2 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 }
+    };
     VkDescriptorPoolCreateInfo poolInfo = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                             .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-                                            .maxSets = MAX_TEXTURES,
-                                            .poolSizeCount = 1, .pPoolSizes = &poolSize };
+                                            .maxSets = MAX_TEXTURES * 2 + 1,
+                                            .poolSizeCount = 2, .pPoolSizes = poolSizes };
     CHECK(vkCreateDescriptorPool(r->device, &poolInfo, NULL, &r->descriptorPool),
           "cannot create the descriptor pool");
 
@@ -483,10 +516,45 @@ static int create_pipeline(VulkanRenderer* r) {
         r->blurDescriptor = sets[1];
     }
 
-    VkPushConstantRange pushRange = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    VkDescriptorSetLayoutBinding meshBinding = {
+        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT
+    };
+    layoutInfo.pBindings = &meshBinding;
+    CHECK(vkCreateDescriptorSetLayout(r->device, &layoutInfo, NULL, &r->meshLayout),
+          "cannot create the mesh descriptor layout");
+    VkBufferCreateInfo meshInfo = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = (VkDeviceSize)MAX_EFFECTS * EFFECT_VERTICES * 8 * sizeof(float),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+    };
+    CHECK(vkCreateBuffer(r->device, &meshInfo, NULL, &r->meshBuffer), "cannot create the effect mesh buffer");
+    VkMemoryRequirements meshReq;
+    vkGetBufferMemoryRequirements(r->device, r->meshBuffer, &meshReq);
+    uint32_t memoryType = find_memory_type(r, meshReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memoryType == UINT32_MAX) memoryType = find_memory_type(r, meshReq.memoryTypeBits, 0);
+    if (memoryType == UINT32_MAX) {
+        fprintf(stderr, "NoirCompositor: no memory type for effect meshes\n");
+        return 0;
+    }
+    VkMemoryAllocateInfo meshAlloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                      .allocationSize = meshReq.size, .memoryTypeIndex = memoryType };
+    CHECK(vkAllocateMemory(r->device, &meshAlloc, NULL, &r->meshMemory), "cannot allocate effect meshes");
+    CHECK(vkBindBufferMemory(r->device, r->meshBuffer, r->meshMemory, 0), "cannot bind effect meshes");
+    VkDescriptorSetAllocateInfo meshSet = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = r->descriptorPool, .descriptorSetCount = 1, .pSetLayouts = &r->meshLayout };
+    CHECK(vkAllocateDescriptorSets(r->device, &meshSet, &r->meshDescriptor), "cannot allocate the mesh descriptor");
+    VkDescriptorBufferInfo meshBuffer = { r->meshBuffer, 0, VK_WHOLE_SIZE };
+    VkWriteDescriptorSet meshWrite = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = r->meshDescriptor, .dstBinding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &meshBuffer };
+    vkUpdateDescriptorSets(r->device, 1, &meshWrite, 0, NULL);
+
+    VkPushConstantRange pushRange = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                                       0, sizeof(PushConstants) };
+    const VkDescriptorSetLayout setLayouts[] = { r->descriptorLayout, r->meshLayout };
     VkPipelineLayoutCreateInfo plInfo = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                          .setLayoutCount = 1, .pSetLayouts = &r->descriptorLayout,
+                                          .setLayoutCount = 2, .pSetLayouts = setLayouts,
                                           .pushConstantRangeCount = 1, .pPushConstantRanges = &pushRange };
     CHECK(vkCreatePipelineLayout(r->device, &plInfo, NULL, &r->pipelineLayout), "cannot create the pipeline layout");
 
@@ -538,6 +606,18 @@ static int create_pipeline(VulkanRenderer* r) {
     vkDestroyShaderModule(r->device, vert, NULL);
     vkDestroyShaderModule(r->device, frag, NULL);
     CHECK(result, "cannot create the graphics pipeline");
+    if (r->effectsSupported) {
+        VkShaderModule compute = create_shader(r, effects_comp_spv, sizeof(effects_comp_spv));
+        VkComputePipelineCreateInfo computeInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = compute, .pName = "main" },
+            .layout = r->pipelineLayout
+        };
+        result = vkCreateComputePipelines(r->device, VK_NULL_HANDLE, 1, &computeInfo, NULL, &r->computePipeline);
+        vkDestroyShaderModule(r->device, compute, NULL);
+        CHECK(result, "cannot create the effects compute pipeline");
+    }
     return 1;
 }
 
@@ -635,6 +715,7 @@ void renderer_texture_destroy(VulkanRenderer* r, RendererTexture* t) {
     vkWaitForFences(r->device, 1, &r->inFlight, VK_TRUE, UINT64_MAX);
     dirty_remove(r, t);
     if (t->descriptor) vkFreeDescriptorSets(r->device, r->descriptorPool, 1, &t->descriptor);
+    if (t->effectDescriptor) vkFreeDescriptorSets(r->device, r->descriptorPool, 1, &t->effectDescriptor);
     if (t->view) vkDestroyImageView(r->device, t->view, NULL);
     if (t->image) vkDestroyImage(r->device, t->image, NULL);
     if (t->imageMemory) vkFreeMemory(r->device, t->imageMemory, NULL);
@@ -728,6 +809,64 @@ int renderer_blur_supported(const VulkanRenderer* r) {
     return r->blurSupported;
 }
 
+int renderer_effects_supported(const VulkanRenderer* r) {
+    return r->effectsSupported;
+}
+
+int renderer_prepare_effect(VulkanRenderer* r, RendererTexture* texture,
+                            int x, int y, int width, int height, int hasAlpha,
+                            int kind, float progress, float seed,
+                            const float target[4], const float motion[4]) {
+    if (!r->effectsSupported || !texture) return 0;
+    if (r->effectCount == MAX_EFFECTS) {
+        fprintf(stderr, "NoirCompositor: effect mesh capacity reached\n");
+        return 0;
+    }
+    if (!texture->effectDescriptor) {
+        VkDescriptorSetAllocateInfo info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = r->descriptorPool, .descriptorSetCount = 1, .pSetLayouts = &r->descriptorLayout };
+        if (vkAllocateDescriptorSets(r->device, &info, &texture->effectDescriptor) != VK_SUCCESS) {
+            fprintf(stderr, "NoirCompositor: cannot allocate the effect texture descriptor\n");
+            return 0;
+        }
+        VkDescriptorImageInfo image = { r->linearSampler, texture->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = texture->effectDescriptor, .dstBinding = 0, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &image };
+        vkUpdateDescriptorSets(r->device, 1, &write, 0, NULL);
+    }
+    int slot = r->effectCount++;
+    r->effects[slot].texture = texture;
+    PushConstants* push = &r->effects[slot].push;
+    *push = (PushConstants) {
+        .rect = { x, y, width, height },
+        .screen = { r->extent.width, r->extent.height },
+        .mode = hasAlpha ? 1.0f : 0.0f, .opacity = 1.0f,
+        .uvRect = { 0, 0, 1, 1 },
+        .effect = { kind, progress, slot, seed }
+    };
+    memcpy(push->target, target, sizeof(push->target));
+    memcpy(push->motion, motion, sizeof(push->motion));
+    return 1;
+}
+
+static void compute_effects(VulkanRenderer* r) {
+    if (!r->effectCount) return;
+    vkCmdBindPipeline(r->commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, r->computePipeline);
+    vkCmdBindDescriptorSets(r->commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipelineLayout,
+                            1, 1, &r->meshDescriptor, 0, NULL);
+    for (int i = 0; i < r->effectCount; i++) {
+        vkCmdPushConstants(r->commandBuffer, r->pipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(PushConstants), &r->effects[i].push);
+        vkCmdDispatch(r->commandBuffer, (EFFECT_VERTICES + 63) / 64, 1, 1);
+    }
+    VkMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(r->commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                         0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
 int renderer_begin_frame(VulkanRenderer* r, int offscreen) {
     // One frame in flight: after this wait the staging buffers are ours again.
     vkWaitForFences(r->device, 1, &r->inFlight, VK_TRUE, UINT64_MAX);
@@ -735,10 +874,12 @@ int renderer_begin_frame(VulkanRenderer* r, int offscreen) {
     VkResult acquired = vkAcquireNextImageKHR(r->device, r->swapchain, UINT64_MAX,
                                               r->imageAvailable, VK_NULL_HANDLE, &r->imageIndex);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        r->effectCount = 0;
         recreate_swapchain(r);
         return 0;
     }
     if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+        r->effectCount = 0;
         return 0;
     }
     vkResetFences(r->device, 1, &r->inFlight);
@@ -749,6 +890,7 @@ int renderer_begin_frame(VulkanRenderer* r, int offscreen) {
                                            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     vkBeginCommandBuffer(cb, &beginInfo);
     upload_dirty_textures(r);
+    compute_effects(r);
 
     r->offscreen = offscreen && r->blurSupported && r->sceneFramebuffer;
     if (r->offscreen && !r->levelsReady) {
@@ -871,13 +1013,26 @@ void renderer_draw_blur(VulkanRenderer* r, int x, int y, int width, int height) 
 static void draw_quad_set(VulkanRenderer* r, VkDescriptorSet set, const PushConstants* push) {
     vkCmdBindDescriptorSets(r->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipelineLayout,
                             0, 1, &set, 0, NULL);
+    vkCmdBindDescriptorSets(r->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipelineLayout,
+                            1, 1, &r->meshDescriptor, 0, NULL);
     vkCmdPushConstants(r->commandBuffer, r->pipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*push), push);
-    vkCmdDraw(r->commandBuffer, 6, 1, 0, 0);
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(*push), push);
+    vkCmdDraw(r->commandBuffer, push->effect[0] > 0.5f ? EFFECT_VERTICES : 6, 1, 0, 0);
 }
 
 static void draw_quad(VulkanRenderer* r, RendererTexture* texture, const PushConstants* push) {
     draw_quad_set(r, texture->descriptor, push);
+}
+
+void renderer_draw_effect(VulkanRenderer* r, RendererTexture* texture) {
+    if (!texture || !texture->initialized) return;
+    for (int i = 0; i < r->effectCount; i++) {
+        if (r->effects[i].texture == texture) {
+            draw_quad_set(r, texture->effectDescriptor, &r->effects[i].push);
+            return;
+        }
+    }
 }
 
 void renderer_draw_texture(VulkanRenderer* r, RendererTexture* texture, int x, int y, int width, int height,
@@ -909,6 +1064,7 @@ void renderer_draw_shadow(VulkanRenderer* r, int x, int y, int width, int height
 }
 
 void renderer_end_frame(VulkanRenderer* r) {
+    r->effectCount = 0;
     vkCmdEndRenderPass(r->commandBuffer);
     if (r->offscreen) {
         // The finished scene, drawn onto the swapchain image.
@@ -998,13 +1154,17 @@ void renderer_destroy(VulkanRenderer* r) {
         if (r->blank) renderer_texture_destroy(r, r->blank);
         destroy_swapchain(r);
         if (r->pipeline) vkDestroyPipeline(r->device, r->pipeline, NULL);
+        if (r->computePipeline) vkDestroyPipeline(r->device, r->computePipeline, NULL);
         if (r->pipelineLayout) vkDestroyPipelineLayout(r->device, r->pipelineLayout, NULL);
+        if (r->meshBuffer) vkDestroyBuffer(r->device, r->meshBuffer, NULL);
+        if (r->meshMemory) vkFreeMemory(r->device, r->meshMemory, NULL);
         if (r->sampler) vkDestroySampler(r->device, r->sampler, NULL);
         if (r->linearSampler) vkDestroySampler(r->device, r->linearSampler, NULL);
         if (r->scenePassClear) vkDestroyRenderPass(r->device, r->scenePassClear, NULL);
         if (r->scenePassLoad) vkDestroyRenderPass(r->device, r->scenePassLoad, NULL);
         if (r->descriptorPool) vkDestroyDescriptorPool(r->device, r->descriptorPool, NULL);
         if (r->descriptorLayout) vkDestroyDescriptorSetLayout(r->device, r->descriptorLayout, NULL);
+        if (r->meshLayout) vkDestroyDescriptorSetLayout(r->device, r->meshLayout, NULL);
         if (r->renderPass) vkDestroyRenderPass(r->device, r->renderPass, NULL);
         if (r->imageAvailable) vkDestroySemaphore(r->device, r->imageAvailable, NULL);
         if (r->renderFinished) vkDestroySemaphore(r->device, r->renderFinished, NULL);

@@ -10,6 +10,7 @@
 #include <X11/extensions/shape.h>
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
@@ -21,6 +22,9 @@
 #define SHADOW_STRENGTH 0.55f
 #define FRAME_INTERVAL_MS 16
 #define MAX_BLUR_RECTS 16
+
+enum { EFFECT_NONE, EFFECT_WOBBLE, EFFECT_LAMP, EFFECT_SHATTER };
+extern void compositor_motion_settings(int* reduced, float* scale);
 
 // One top-level window (a direct child of the root).
 typedef struct {
@@ -40,6 +44,16 @@ typedef struct {
     // to the window's outer top-left corner.
     int blurCount;
     int blurRects[MAX_BLUR_RECTS][4];
+    int effect;
+    int effectReady;
+    int minimizing;
+    long long effectStart;
+    float duration;
+    float lampFrom;
+    float effectSeed;
+    float target[4];
+    float motion[4];
+    float velocity[2];
 } CompWindow;
 
 struct NoirCompositor {
@@ -57,6 +71,10 @@ struct NoirCompositor {
     int needsFrame;
     long long lastFrameMs;
     Atom blurAtom;
+    Atom iconGeometryAtom;
+    int reducedMotion;
+    float motionScale;
+    long long settingsRead;
 };
 
 static long long now_ms(void) {
@@ -195,11 +213,20 @@ static void remove_window(NoirCompositor* c, Window id, int destroyed) {
         return;
     }
     CompWindow* w = &c->windows[index];
-    release_contents(c, w);
     // The server frees a window's damage objects along with the window.
     if (w->damage && !destroyed) {
         XDamageDestroy(c->display, w->damage);
     }
+    if (w->effect == EFFECT_SHATTER) {
+        // The texture outlives the X window, at its original stacking position.
+        if (w->pixmap) XFreePixmap(c->display, w->pixmap);
+        w->pixmap = None;
+        w->damage = None;
+        w->id = None;
+        w->viewable = 0;
+        return;
+    }
+    release_contents(c, w);
     memmove(w, w + 1, sizeof(CompWindow) * (size_t)(c->count - index - 1));
     c->count--;
     c->needsFrame = 1;
@@ -352,6 +379,108 @@ static void handle_damage(NoirCompositor* c, XDamageNotifyEvent* event) {
     }
 }
 
+// --- effects -----------------------------------------------------------------
+
+static void read_motion_settings(NoirCompositor* c) {
+    long long now = now_ms();
+    if (c->settingsRead && now - c->settingsRead < 250) return;
+    compositor_motion_settings(&c->reducedMotion, &c->motionScale);
+    c->settingsRead = now;
+}
+
+static float lamp_progress(const CompWindow* w, long long now) {
+    float t = w->duration > 0 ? (float)(now - w->effectStart) / w->duration : 1.0f;
+    t = fminf(1.0f, fmaxf(0.0f, t));
+    return w->lampFrom + ((w->minimizing ? 1.0f : 0.0f) - w->lampFrom) * t;
+}
+
+static void step_wobble(CompWindow* w, long long now, float scale) {
+    const float dt = fmaxf(0.0f, (float)(now - w->effectStart) / (1000.0f * scale));
+    const float decay = expf(-7.0f * dt), cs = cosf(16.0f * dt), sn = sinf(16.0f * dt);
+    for (int axis = 0; axis < 2; axis++) {
+        const float x = w->motion[axis], v = w->velocity[axis];
+        const float b = (v + 7.0f * x) / 16.0f;
+        w->motion[axis] = decay * (x * cs + b * sn);
+        w->velocity[axis] = decay * (v * cs - (7.0f * b + 16.0f * x) * sn);
+    }
+    w->effectStart = now;
+}
+
+void compositor_move(NoirCompositor* c, Window toplevel, int dx, int dy, int grabX, int grabY) {
+    read_motion_settings(c);
+    int index = find_index(c, toplevel);
+    if (index < 0 || c->reducedMotion || !renderer_effects_supported(c->renderer) || (!dx && !dy)) return;
+    CompWindow* w = &c->windows[index];
+    if (w->effect != EFFECT_NONE && w->effect != EFFECT_WOBBLE) return;
+    long long now = now_ms();
+    if (w->effect == EFFECT_WOBBLE) step_wobble(w, now, c->motionScale);
+    else memset(w->velocity, 0, sizeof(w->velocity));
+    w->effect = EFFECT_WOBBLE;
+    w->effectStart = now;
+    w->motion[0] = fmaxf(-85.0f, fminf(85.0f, w->motion[0] - dx * 0.7f));
+    w->motion[1] = fmaxf(-85.0f, fminf(85.0f, w->motion[1] - dy * 0.7f));
+    w->motion[2] = fmaxf(0.0f, fminf(1.0f, (float)grabX / outer_width(w)));
+    w->motion[3] = fmaxf(0.0f, fminf(1.0f, (float)grabY / outer_height(w)));
+    c->needsFrame = 1;
+}
+
+static void lamp_target(NoirCompositor* c, CompWindow* w, Window client) {
+    const int screen = DefaultScreen(c->display);
+    const int sw = DisplayWidth(c->display, screen), sh = DisplayHeight(c->display, screen);
+    w->target[0] = fmaxf(0, fminf(sw - 48, w->x + outer_width(w) * 0.5f - 24));
+    w->target[1] = sh - 8;
+    w->target[2] = 48;
+    w->target[3] = 8;
+    Atom type;
+    int format;
+    unsigned long count, after;
+    unsigned char* data = NULL;
+    if (XGetWindowProperty(c->display, client, c->iconGeometryAtom, 0, 4, False, XA_CARDINAL,
+                           &type, &format, &count, &after, &data) == Success &&
+        type == XA_CARDINAL && format == 32 && count == 4 && !after) {
+        const unsigned long* rect = (const unsigned long*)data;
+        if (rect[2] > 0 && rect[2] <= (unsigned long)sw && rect[3] > 0 && rect[3] <= (unsigned long)sh &&
+            rect[0] < (unsigned long)sw && rect[1] < (unsigned long)sh) {
+            for (int i = 0; i < 4; i++) w->target[i] = (float)rect[i];
+        }
+    }
+    if (data) XFree(data);
+}
+
+void compositor_minimize(NoirCompositor* c, Window toplevel, Window client, int minimized) {
+    read_motion_settings(c);
+    int index = find_index(c, toplevel);
+    if (index < 0 || c->reducedMotion || !renderer_effects_supported(c->renderer)) return;
+    CompWindow* w = &c->windows[index];
+    long long now = now_ms();
+    float from = w->effect == EFFECT_LAMP ? lamp_progress(w, now) : (minimized ? 0.0f : 1.0f);
+    if (w->effect != EFFECT_LAMP) lamp_target(c, w, client);
+    if (minimized && w->viewable) refresh_window(c, w);
+    w->effect = EFFECT_LAMP;
+    w->minimizing = minimized;
+    w->lampFrom = from;
+    w->duration = 560.0f * c->motionScale * fabsf((minimized ? 1.0f : 0.0f) - from);
+    w->effectStart = now;
+    memset(w->motion, 0, sizeof(w->motion));
+    c->needsFrame = 1;
+}
+
+void compositor_close(NoirCompositor* c, Window toplevel) {
+    read_motion_settings(c);
+    int index = find_index(c, toplevel);
+    if (index < 0 || c->reducedMotion || !renderer_effects_supported(c->renderer)) return;
+    CompWindow* w = &c->windows[index];
+    // A real withdrawal/destruction, not a WM_DELETE request which can be refused.
+    // Use the last captured pixels: the client may already have been destroyed.
+    if (!w->texture || !w->viewable || w->effect == EFFECT_SHATTER) return;
+    w->effect = EFFECT_SHATTER;
+    w->effectSeed = (float)(w->id & 0xFFFF);
+    w->viewable = 0;
+    w->duration = 680.0f * c->motionScale;
+    w->effectStart = now_ms();
+    c->needsFrame = 1;
+}
+
 // --- events ------------------------------------------------------------------
 
 void compositor_handle_event(NoirCompositor* c, XEvent* event) {
@@ -382,9 +511,17 @@ void compositor_handle_event(NoirCompositor* c, XEvent* event) {
         if (index >= 0) {
             // Mapping gives the window a new off-screen pixmap, and a framed
             // client is in its frame by now.
-            release_contents(c, &c->windows[index]);
-            c->windows[index].viewable = 1;
-            read_blur(c, &c->windows[index]);
+            CompWindow* w = &c->windows[index];
+            if (w->effect != EFFECT_LAMP) {
+                release_contents(c, w);
+                w->effect = EFFECT_NONE;
+            } else {
+                if (w->pixmap) XFreePixmap(c->display, w->pixmap);
+                w->pixmap = None;
+                w->stale = 1;
+            }
+            w->viewable = 1;
+            read_blur(c, w);
             c->needsFrame = 1;
         }
         break;
@@ -392,8 +529,15 @@ void compositor_handle_event(NoirCompositor* c, XEvent* event) {
     case UnmapNotify: {
         int index = event->xunmap.event == c->root ? find_index(c, event->xunmap.window) : -1;
         if (index >= 0) {
-            release_contents(c, &c->windows[index]);
-            c->windows[index].viewable = 0;
+            CompWindow* w = &c->windows[index];
+            if (w->effect == EFFECT_LAMP || w->effect == EFFECT_SHATTER) {
+                if (w->pixmap) XFreePixmap(c->display, w->pixmap);
+                w->pixmap = None;
+            } else {
+                release_contents(c, w);
+                w->effect = EFFECT_NONE;
+            }
+            w->viewable = 0;
             c->needsFrame = 1;
         }
         break;
@@ -479,17 +623,53 @@ int compositor_frame_delay(const NoirCompositor* c) {
 void compositor_draw(NoirCompositor* c) {
     c->needsFrame = 0;
     c->lastFrameMs = now_ms();
+    read_motion_settings(c);
     for (int i = 0; i < c->count; i++) {
         CompWindow* w = &c->windows[i];
-        if (w->viewable && (w->depth == 24 || w->depth == 32)) {
+        w->effectReady = 0;
+        if (w->effect) {
+            int finished = c->reducedMotion;
+            if (w->effect == EFFECT_WOBBLE) {
+                step_wobble(w, c->lastFrameMs, c->motionScale);
+                finished |= fabsf(w->motion[0]) + fabsf(w->motion[1]) < 0.15f &&
+                            fabsf(w->velocity[0]) + fabsf(w->velocity[1]) < 0.5f;
+            } else {
+                finished |= c->lastFrameMs - w->effectStart >= w->duration;
+            }
+            if (finished) {
+                int shatter = w->effect == EFFECT_SHATTER;
+                w->effect = EFFECT_NONE;
+                memset(w->motion, 0, sizeof(w->motion));
+                if (!w->viewable || shatter) release_contents(c, w);
+                if (w->id == None) {
+                    memmove(w, w + 1, sizeof(*w) * (size_t)(c->count - i - 1));
+                    c->count--;
+                    i--;
+                    continue;
+                }
+            } else {
+                c->needsFrame = 1;
+            }
+        }
+        if (w->viewable && w->effect != EFFECT_SHATTER && (w->depth == 24 || w->depth == 32)) {
             refresh_window(c, w);
         }
+    }
+    // All uploads and compute work are queued before the render pass begins.
+    for (int i = 0; i < c->count; i++) {
+        CompWindow* w = &c->windows[i];
+        if (!w->effect || !w->texture) continue;
+        float progress = w->effect == EFFECT_LAMP ? lamp_progress(w, c->lastFrameMs)
+                       : w->effect == EFFECT_SHATTER ? (float)(c->lastFrameMs - w->effectStart) / w->duration : 0;
+        w->effectReady = renderer_prepare_effect(c->renderer, w->texture,
+            w->x, w->y, outer_width(w), outer_height(w), w->depth == 32,
+            w->effect, progress, w->effectSeed, w->target, w->motion);
     }
     // Only frames with a translucent window asking for blur pay for it.
     int wantBlur = 0;
     for (int i = 0; i < c->count && !wantBlur; i++) {
         const CompWindow* w = &c->windows[i];
-        wantBlur = w->viewable && w->texture && w->depth == 32 && w->blurCount > 0;
+        wantBlur = w->viewable && !w->effect && w->texture && w->depth == 32 && w->blurCount > 0;
     }
     if (!renderer_begin_frame(c->renderer, wantBlur)) {
         c->needsFrame = 1;
@@ -497,21 +677,25 @@ void compositor_draw(NoirCompositor* c) {
     }
     for (int i = 0; i < c->count; i++) {
         CompWindow* w = &c->windows[i];
-        if (!w->viewable || !w->texture) {
+        if ((!w->viewable && !w->effectReady) || !w->texture) {
             continue;
         }
-        if (w->shadow) {
+        if (w->shadow && !w->effectReady) {
             renderer_draw_shadow(c->renderer, w->x, w->y + SHADOW_OFFSET_Y, outer_width(w), outer_height(w),
                                  SHADOW_RADIUS, SHADOW_STRENGTH);
         }
-        if (w->depth == 32) {
+        if (w->depth == 32 && !w->effectReady) {
             for (int b = 0; b < w->blurCount; b++) {
                 const int* rect = w->blurRects[b];
                 renderer_draw_blur(c->renderer, w->x + rect[0], w->y + rect[1], rect[2], rect[3]);
             }
         }
-        renderer_draw_texture(c->renderer, w->texture, w->x, w->y, outer_width(w), outer_height(w),
-                              w->depth == 32, 1.0f);
+        if (w->effectReady) {
+            renderer_draw_effect(c->renderer, w->texture);
+        } else {
+            renderer_draw_texture(c->renderer, w->texture, w->x, w->y, outer_width(w), outer_height(w),
+                                  w->depth == 32, 1.0f);
+        }
     }
     renderer_end_frame(c->renderer);
 }
@@ -545,6 +729,8 @@ NoirCompositor* compositor_create(Display* display, Window root) {
     c->damageEvent = damageEvent;
     c->hasShm = XShmQueryExtension(display);
     c->blurAtom = XInternAtom(display, "_KDE_NET_WM_BLUR_BEHIND_REGION", False);
+    c->iconGeometryAtom = XInternAtom(display, "_NET_WM_ICON_GEOMETRY", False);
+    c->motionScale = 1.0f;
 
     // The overlay sits above every window and below the pointer. It must not
     // take input, so clicks fall through to the real windows underneath.

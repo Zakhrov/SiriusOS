@@ -164,11 +164,14 @@ void NoirWM_run(NoirWM* wm) {
     while (!quitRequested) {
         while (XPending(wm->display) > 0) {
             XNextEvent(wm->display, &event);
+            // Snapshot withdrawals before the compositor releases their textures.
+            const int closing = event.type == UnmapNotify || event.type == DestroyNotify;
+            if (closing) handle_event(wm, &event);
             // The compositor mirrors every top-level window, managed or not.
             if (wm->compositor) {
                 compositor_handle_event(wm->compositor, &event);
             }
-            handle_event(wm, &event);
+            if (!closing) handle_event(wm, &event);
         }
         // Sleep until the X server has something for us, or until the next
         // frame is due when there is one to draw.

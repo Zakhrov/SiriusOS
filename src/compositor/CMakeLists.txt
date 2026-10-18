@@ -6,7 +6,7 @@ find_program(GLSLANG_VALIDATOR NAMES glslangValidator glslang REQUIRED)
 set(SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_DIR})
 set(SHADER_HEADERS)
-foreach(shader quad.vert quad.frag)
+foreach(shader quad.vert quad.frag effects.comp)
     string(REPLACE "." "_" shader_name ${shader})
     set(header ${SHADER_DIR}/${shader_name}.h)
     add_custom_command(
@@ -19,7 +19,7 @@ foreach(shader quad.vert quad.frag)
 endforeach()
 
 add_library(NoirVulkanCompositor SHARED
-    src/VulkanRenderer.c src/Compositor.c ${SHADER_HEADERS})
+    src/VulkanRenderer.c src/Compositor.c src/MotionSettings.cpp ${SHADER_HEADERS})
 set_target_properties(NoirVulkanCompositor PROPERTIES
     VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_include_directories(NoirVulkanCompositor
@@ -27,6 +27,15 @@ target_include_directories(NoirVulkanCompositor
     PRIVATE ${X11_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(NoirVulkanCompositor
     ${X11_LIBRARIES} ${X11_X11_xcb_LIB} ${X11_Xext_LIB} ${X11_Xcomposite_LIB} ${X11_Xdamage_LIB} ${X11_Xfixes_LIB}
-    Vulkan::Vulkan NoirVulkanDevice)
+    Vulkan::Vulkan NoirVulkanDevice Qt6::Core m)
 
 install(TARGETS NoirVulkanCompositor LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+find_program(XVFB_EXECUTABLE Xvfb)
+if(XVFB_EXECUTABLE)
+    add_executable(noir-compositor-effects-test tests/effects.c)
+    target_link_libraries(noir-compositor-effects-test PRIVATE NoirVulkanCompositor ${X11_LIBRARIES} ${X11_Xcomposite_LIB})
+    add_test(NAME noir-compositor-effects
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-effects $<TARGET_FILE:noir-compositor-effects-test>)
+    set_tests_properties(noir-compositor-effects PROPERTIES TIMEOUT 60)
+endif()

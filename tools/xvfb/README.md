@@ -160,6 +160,14 @@ second one, and that a changed setting reaches the running shell. It saves
 exiting non-zero if any check fails. `noir-xvfb smoke --compositor` runs the
 same checks with compositing on.
 
+`ctest --test-dir build -R '^noir-compositor-effects$' --output-on-failure`
+also starts an isolated 640x480 display and checks rendered pixels for wobble
+and settling, lamp minimize/restore and mid-flight reversal, shatter snapshot
+lifetime, animation scaling, rapid toggles and Reduce Motion. It does not
+touch an existing harness session or host preferences. Build the
+`noir-compositor-effects-test` target first; set `NOIR_VK_VALIDATION=1` to
+check Vulkan calls when the validation layer is installed.
+
 ## Files
 
 ```

@@ -2,6 +2,7 @@
 #include "X11Integration.h"
 
 #include <QCoreApplication>
+#include <QQuickWindow>
 
 #include <memory>
 
@@ -266,6 +267,34 @@ void TaskModel::sendClientMessage(xcb_window_t window, xcb_atom_t type, const qu
     xcb_send_event(x11->connection(), 0, x11->rootWindow(),
                    XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
                    reinterpret_cast<const char *>(&event));
+    xcb_flush(x11->connection());
+}
+
+void TaskModel::setIconGeometry(int row, QQuickItem *item)
+{
+    X11Integration *x11 = X11Integration::instance();
+    if (m_demo || !x11->isAvailable() || row < 0 || row >= m_tasks.size())
+        return;
+    if (!item || !item->window() || !item->isVisible()) {
+        if (!m_tasks[row].iconGeometry.isNull()) {
+            m_tasks[row].iconGeometry = {};
+            xcb_delete_property(x11->connection(), m_tasks[row].id, x11->atom("_NET_WM_ICON_GEOMETRY"));
+            xcb_flush(x11->connection());
+        }
+        return;
+    }
+    QQuickWindow *window = item->window();
+    const QPointF position = item->mapToGlobal(QPointF(0, 0));
+    const qreal dpr = window->devicePixelRatio();
+    const QRect rect(qRound(position.x() * dpr), qRound(position.y() * dpr),
+                     qRound(item->width() * dpr), qRound(item->height() * dpr));
+    if (rect.isEmpty() || rect == m_tasks[row].iconGeometry)
+        return;
+    m_tasks[row].iconGeometry = rect;
+    const quint32 values[] = { quint32(qMax(0, rect.x())), quint32(qMax(0, rect.y())),
+                               quint32(rect.width()), quint32(rect.height()) };
+    xcb_change_property(x11->connection(), XCB_PROP_MODE_REPLACE, m_tasks[row].id,
+                        x11->atom("_NET_WM_ICON_GEOMETRY"), XCB_ATOM_CARDINAL, 32, 4, values);
     xcb_flush(x11->connection());
 }
 

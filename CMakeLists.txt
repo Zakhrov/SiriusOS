@@ -10,7 +10,7 @@ find_package(Vulkan REQUIRED)
 find_package(X11 REQUIRED)
 include(GNUInstallDirs)
 
+enable_testing()
 add_subdirectory(src)
 
-enable_testing()
 add_subdirectory(tools/xvfb)
