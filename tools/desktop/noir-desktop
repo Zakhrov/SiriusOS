@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# noir-desktop: try the Noir desktop yourself, with the real GPU.
+#
+# Runs the full session (NoirWM with its Vulkan compositor, NoirShell, the
+# Control Center) from the build tree on a nested X server in a window on
+# your current desktop. The X server is a rootful Xwayland with glamor, so it
+# offers DRI3 on your GPU: Noir presents straight from the GPU and composites
+# translucent glass, as it does on bare metal. See tools/desktop/README.md.
+set -euo pipefail
+
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SELF_DIR/../.." && pwd)
+BUILD=${NOIR_BUILD_DIR:-$REPO/build}
+STATE=${NOIR_DESKTOP_STATE:-$BUILD/desktop}
+SESSION=$SELF_DIR/noir-dev-session
+XSESSION_FILE=/usr/share/xsessions/noir-dev.desktop
+
+usage() {
+    cat <<EOF
+Usage: noir-desktop <command> [options]
+
+  start [options]       build, then open the Noir desktop in a window
+      --size WxH          window size (default: 85% of your screen, at most 1920x1080)
+      --fullscreen        cover the whole screen instead
+      --no-build          use the build tree as it is
+      --clean-profile     a fresh settings profile in $STATE/profile instead of your
+                          own ~/.config (kept between runs; delete it to reset)
+      --gpu NAME          render on this GPU (part of its Vulkan name, e.g. "renoir");
+                          sets NOIR_VK_DEVICE for the session
+      --validation        Vulkan validation layer on (slow, for development)
+      --no-compositor     NoirWM without its compositor
+      --demo              sample tasks and notifications in the shell
+  restart [--no-build]  rebuild and restart the session, keeping the window
+  stop                  close it all
+  status                what is running, and whether it has the full 3D path
+  logs [shell|wm|control-center|session|xwayland|compositor]
+  shot [FILE]           screenshot of the Noir screen
+  run CMD...            start a program in the Noir session (e.g. run vkcube, run xterm)
+  env                   shell exports to talk to the session from a terminal
+
+Bare metal
+  install-session       add "Noir (development build)" to the login screen (sudo)
+  remove-session        take it away again (sudo)
+
+State and logs live in $STATE.
+EOF
+}
+
+die() { echo "noir-desktop: $*" >&2; exit 1; }
+say() { echo "noir-desktop: $*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed${2:+ ($2)}"; }
+
+pid_of() { [[ -s $STATE/$1.pid ]] && cat "$STATE/$1.pid"; }
+alive() { local pid; pid=$(pid_of "$1") && kill -0 "$pid" 2>/dev/null; }
+
+# Waits up to $1 seconds for "$@" (after the first two arguments) to succeed.
+wait_for() {
+    local seconds=$1 what=$2; shift 2
+    for ((i = 0; i < seconds * 10; i++)); do
+        "$@" >/dev/null 2>&1 && return 0
+        sleep 0.1
+    done
+    say "timed out waiting for $what"
+    return 1
+}
+
+noir_display() { echo ":$(<"$STATE/display")"; }
+
+# The environment the Noir session runs in: the nested display, its own
+# session bus, and nothing from the host desktop that would confuse it.
+session_env() {
+    [[ -s $STATE/display ]] || die "the Noir desktop is not running (noir-desktop start)"
+    unset WAYLAND_DISPLAY SESSION_MANAGER DESKTOP_SESSION XDG_SESSION_DESKTOP KDE_FULL_SESSION \
+          KDE_SESSION_VERSION KDE_SESSION_UID GNOME_DESKTOP_SESSION_ID QT_QPA_PLATFORMTHEME \
+          QT_SCALE_FACTOR QT_SCREEN_SCALE_FACTORS QT_IM_MODULE GTK_IM_MODULE XMODIFIERS \
+          QSG_RHI_BACKEND MESA_VK_WSI_DEBUG
+    export DISPLAY
+    DISPLAY=$(noir_display)
+    export DBUS_SESSION_BUS_ADDRESS
+    DBUS_SESSION_BUS_ADDRESS=$(<"$STATE/bus.addr")
+    export XDG_CURRENT_DESKTOP=Noir XDG_SESSION_TYPE=x11
+    export XDG_STATE_HOME=$STATE/state
+    # Options chosen at start.
+    if [[ -s $STATE/options.env ]]; then
+        # shellcheck disable=SC1091
+        . "$STATE/options.env"
+    fi
+}
+
+host_screen_size() {
+    if [[ -n ${DISPLAY:-} ]] && command -v xdpyinfo >/dev/null 2>&1; then
+        xdpyinfo 2>/dev/null | sed -n 's/^ *dimensions: *\([0-9]*x[0-9]*\) pixels.*/\1/p' | head -n 1
+    fi
+}
+
+# (Captured first: with pipefail, grep -q stopping early would fail the pipe.)
+has_dri3() {
+    local extensions
+    extensions=$(DISPLAY=$(noir_display) xdpyinfo -queryExtensions 2>/dev/null)
+    grep -q '^ *DRI3' <<<"$extensions"
+}
+
+# --- start ----------------------------------------------------------------------
+
+start_compositor() {
+    # $1 = socket name, $2/$3 = size. A nested Wayland compositor in an X11
+    # window, for Xwayland to run in.
+    local socket=$1 width=$2 height=$3
+    if command -v kwin_wayland >/dev/null 2>&1; then
+        local help; help=$(kwin_wayland --help 2>&1 || true)
+        local -a args=(--x11-display "$DISPLAY" --socket "$socket" --width "$width" --height "$height")
+        for flag in --no-lockscreen --no-global-shortcuts --no-kactivities; do
+            [[ $help == *"$flag"* ]] && args+=("$flag")
+        done
+        echo kwin_wayland >"$STATE/compositor.name"
+        setsid kwin_wayland "${args[@]}" >"$STATE/compositor.log" 2>&1 </dev/null &
+    elif command -v weston >/dev/null 2>&1; then
+        echo weston >"$STATE/compositor.name"
+        setsid weston --backend=x11-backend.so --socket="$socket" --width="$width" --height="$height" \
+            --idle-time=0 >"$STATE/compositor.log" 2>&1 </dev/null &
+    else
+        die "no nested Wayland compositor found: install kwin_wayland (KDE) or weston"
+    fi
+    echo $! >"$STATE/compositor.pid"
+    wait_for 15 "the nested compositor" test -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$socket" \
+        || { tail -n 15 "$STATE/compositor.log" >&2; cmd_stop >/dev/null; exit 1; }
+}
+
+launch_session() {
+    : >"$STATE/session.log"
+    # In a subshell: the session's environment must not leak into this script.
+    (
+        session_env
+        setsid "$SESSION" >>"$STATE/session.log" 2>&1 </dev/null &
+        echo $! >"$STATE/session.pid"
+    )
+    local log=$STATE/state/noir/shell.log
+    if ! wait_for 30 "the Noir shell" grep -q 'rendering with' "$log"; then
+        tail -n 20 "$STATE/session.log" "$log" 2>/dev/null >&2 || true
+        return 1
+    fi
+    # Give the compositor and the shell's surfaces a moment to settle.
+    sleep 1
+}
+
+build_tree() {
+    need cmake
+    say "building $BUILD"
+    if [[ ! -f $BUILD/CMakeCache.txt ]]; then
+        cmake -B "$BUILD" -S "$REPO" -Wno-dev >/dev/null
+    fi
+    mkdir -p "$STATE"
+    if ! cmake --build "$BUILD" -j"$(nproc)" >"$STATE/build.log" 2>&1; then
+        grep -E 'error' "$STATE/build.log" | head -n 20 >&2
+        die "the build failed; full log in $STATE/build.log"
+    fi
+}
+
+cmd_start() {
+    local size="" fullscreen=0 build=1 clean=0 gpu="" validation=0 compositor=1 demo=0
+    while (($#)); do
+        case $1 in
+            --size) size=$2; shift 2 ;;
+            --fullscreen) fullscreen=1; shift ;;
+            --no-build) build=0; shift ;;
+            --clean-profile) clean=1; shift ;;
+            --gpu) gpu=$2; shift 2 ;;
+            --validation) validation=1; shift ;;
+            --no-compositor) compositor=0; shift ;;
+            --demo) demo=1; shift ;;
+            *) die "start: unknown option $1" ;;
+        esac
+    done
+    if [[ -s $STATE/display ]] && alive xwayland; then
+        die "already running on $(noir_display) (noir-desktop stop, or restart)"
+    fi
+    need Xwayland; need dbus-daemon; need xdpyinfo "xdpyinfo"
+    [[ -n ${DISPLAY:-} || -n ${WAYLAND_DISPLAY:-} ]] || die "run this from a graphical session"
+    ((build)) && build_tree
+    [[ -x $BUILD/src/shell/NoirShell ]] || die "nothing built in $BUILD (drop --no-build)"
+
+    local host; host=$(host_screen_size)
+    if ((fullscreen)) && [[ -n $host ]]; then
+        size=$host
+    elif [[ -z $size ]]; then
+        if [[ $host =~ ^([0-9]+)x([0-9]+)$ ]]; then
+            local w=$((BASH_REMATCH[1] * 85 / 100)) h=$((BASH_REMATCH[2] * 85 / 100))
+            ((w > 1920)) && w=1920
+            ((h > 1080)) && h=1080
+            size=${w}x${h}
+        else
+            size=1600x900
+        fi
+    fi
+    [[ $size =~ ^([0-9]+)x([0-9]+)$ ]] || die "--size expects WxH"
+    local width=${BASH_REMATCH[1]} height=${BASH_REMATCH[2]}
+
+    mkdir -p "$STATE/state" "$STATE/shots"
+    rm -f "$STATE"/*.pid "$STATE"/*.log "$STATE/display" "$STATE/bus.addr" "$STATE/options.env" "$STATE/compositor.name"
+    rm -rf "$STATE/state/noir"
+
+    # 1. Somewhere for Xwayland to live: the host itself when it is a Wayland
+    #    session, otherwise a nested Wayland compositor in an X11 window.
+    local wayland mode
+    if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+        wayland=$WAYLAND_DISPLAY
+        mode="Xwayland window on your Wayland desktop"
+    else
+        wayland="noir-desktop-$$"
+        start_compositor "$wayland" "$width" "$height"
+        mode="Xwayland in $(<"$STATE/compositor.name"), nested in an X11 window"
+    fi
+    echo "$mode" >"$STATE/mode"
+
+    # 2. A rootful Xwayland: a whole X screen in one window, with glamor and DRI3 on the GPU.
+    local -a xargs=(-displayfd 3 -geometry "${width}x${height}" -nolisten tcp -noreset)
+    # Inside the nested compositor the X screen fills its output exactly; on
+    # a Wayland desktop it is an ordinary, decorated window.
+    if [[ -z ${WAYLAND_DISPLAY:-} || $fullscreen -eq 1 ]]; then
+        xargs+=(-fullscreen)
+    elif [[ $(Xwayland -help 2>&1) == *-decorate* ]]; then
+        xargs+=(-decorate)
+    fi
+    WAYLAND_DISPLAY=$wayland setsid Xwayland "${xargs[@]}" 3>"$STATE/display" >"$STATE/xwayland.log" 2>&1 </dev/null &
+    echo $! >"$STATE/xwayland.pid"
+    wait_for 15 "Xwayland" test -s "$STATE/display" \
+        || { tail -n 15 "$STATE/xwayland.log" >&2; cmd_stop >/dev/null; exit 1; }
+    wait_for 10 "the X server to answer" env DISPLAY="$(noir_display)" xdpyinfo -queryExtensions
+
+    # 3. A session bus of its own, so the shell can be the notification
+    #    daemon without fighting the host desktop's.
+    dbus-daemon --session --fork --print-address=3 --print-pid=4 3>"$STATE/bus.addr" 4>"$STATE/dbus.pid"
+    wait_for 5 "the session bus" test -s "$STATE/bus.addr"
+
+    # 4. The session's options.
+    {
+        ((clean)) && { mkdir -p "$STATE/profile"; echo "export XDG_CONFIG_HOME='$STATE/profile'"; }
+        [[ -n $gpu ]] && echo "export NOIR_VK_DEVICE='$gpu'"
+        ((validation)) && echo "export NOIR_VK_VALIDATION=1"
+        ((compositor)) || echo "export NOIR_WM_ARGS='--no-compositor'"
+        ((demo)) && echo "export NOIR_SHELL_ARGS='--demo'"
+        true
+    } >"$STATE/options.env"
+
+    # 5. The Noir session itself.
+    if ! launch_session; then
+        cmd_stop >/dev/null
+        die "the session did not come up; logs in $STATE"
+    fi
+
+    # Cover the screen: make the nested compositor's window fullscreen.
+    if ((fullscreen)) && [[ -z ${WAYLAND_DISPLAY:-} ]] && command -v wmctrl >/dev/null 2>&1; then
+        local window
+        window=$(wmctrl -lp | awk -v pid="$(pid_of compositor)" '$3 == pid { print $1; exit }')
+        [[ -n $window ]] && wmctrl -i -r "$window" -b add,fullscreen
+    fi
+
+    cmd_status
+    echo
+    echo "Close the window or run 'noir-desktop stop' to end it; 'noir-desktop restart' after a rebuild."
+}
+
+cmd_restart() {
+    local build=1
+    [[ ${1:-} == --no-build ]] && build=0
+    alive xwayland || die "the Noir desktop is not running (noir-desktop start)"
+    ((build)) && build_tree
+    stop_session
+    rm -rf "$STATE/state/noir"
+    launch_session || die "the session did not come up; see noir-desktop logs"
+    cmd_status
+}
+
+# --- stop -----------------------------------------------------------------------
+
+stop_session() {
+    local pid
+    if pid=$(pid_of session) && kill -0 "$pid" 2>/dev/null; then
+        # The session and everything it started share its process group.
+        kill -TERM -- "-$pid" 2>/dev/null || true
+        for _ in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    fi
+    rm -f "$STATE/session.pid"
+}
+
+cmd_stop() {
+    stop_session
+    local name pid
+    for name in xwayland compositor dbus; do
+        if pid=$(pid_of "$name") && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$STATE/$name.pid"
+    done
+    rm -f "$STATE/display" "$STATE/bus.addr"
+    echo "Noir desktop stopped"
+}
+
+# --- inspect --------------------------------------------------------------------
+
+cmd_status() {
+    if [[ ! -s $STATE/display ]] || ! alive xwayland; then
+        echo "not running"
+        return 1
+    fi
+    local display; display=$(noir_display)
+    local size; size=$(DISPLAY=$display xdpyinfo 2>/dev/null | sed -n 's/^ *dimensions: *\([0-9]*x[0-9]*\).*/\1/p')
+    echo "display      $display, $size ($(<"$STATE/mode"))"
+    if has_dri3; then
+        echo "DRI3         yes: Vulkan presents straight from the GPU, as on bare metal"
+    else
+        echo "DRI3         NO: frames are copied through the CPU; this is not the bare-metal path"
+    fi
+    local wm shell
+    wm=$(sed -n 's/^NoirWM: //p' "$STATE/state/noir/wm.log" 2>/dev/null | head -n 1)
+    shell=$(sed -n 's/^NoirShell: //p' "$STATE/state/noir/shell.log" 2>/dev/null | head -n 2 | paste -sd ';' -)
+    echo "window mgr   ${wm:-not running}"
+    echo "shell        ${shell:-not running}"
+    if grep -q 'surfaces stay opaque' "$STATE/state/noir/shell.log" 2>/dev/null || [[ $wm != compositing* ]]; then
+        echo "glass        opaque (no compositor, or no direct presentation)"
+    else
+        echo "glass        translucent, blended by NoirWM's compositor"
+    fi
+    echo "session bus  $(<"$STATE/bus.addr")"
+    [[ -s $STATE/options.env ]] && echo "options      $(sed 's/^export //' "$STATE/options.env" | paste -sd ' ' -)"
+    return 0
+}
+
+cmd_logs() {
+    local which=${1:-shell} file
+    case $which in
+        shell | wm | control-center) file=$STATE/state/noir/$which.log ;;
+        session | xwayland | compositor) file=$STATE/$which.log ;;
+        *) die "logs: expected shell, wm, control-center, session, xwayland or compositor" ;;
+    esac
+    [[ -f $file ]] || die "no $which log yet"
+    tail -n 60 "$file"
+}
+
+cmd_shot() {
+    need import "ImageMagick"
+    local file=${1:-$STATE/shots/noir-$(date +%H%M%S).png}
+    import -display "$(noir_display)" -window root "$file"
+    echo "$file"
+}
+
+cmd_run() {
+    (($#)) || die "run: expected a command"
+    session_env
+    export PATH="$BUILD/src/control_center:$BUILD/src/shell:$BUILD/src/window_manager:$PATH"
+    setsid "$@" >>"$STATE/clients.log" 2>&1 </dev/null &
+    echo "started $1 (pid $!), output in $STATE/clients.log"
+}
+
+cmd_env() {
+    session_env
+    echo "export DISPLAY=$DISPLAY"
+    echo "export DBUS_SESSION_BUS_ADDRESS='$DBUS_SESSION_BUS_ADDRESS'"
+    echo "export XDG_CURRENT_DESKTOP=Noir XDG_SESSION_TYPE=x11"
+    echo "unset WAYLAND_DISPLAY"
+}
+
+# --- bare metal -----------------------------------------------------------------
+
+cmd_install_session() {
+    [[ -x $BUILD/src/shell/NoirShell ]] || die "build the tree first"
+    local entry
+    entry=$(cat <<EOF
+[Desktop Entry]
+Type=XSession
+Name=Noir (development build)
+Comment=Noir Desktop Environment from $BUILD
+Exec=$SESSION
+TryExec=$SESSION
+DesktopNames=Noir
+EOF
+)
+    say "adding $XSESSION_FILE (sudo):"
+    echo "$entry" | sed 's/^/    /' >&2
+    echo "$entry" | sudo tee "$XSESSION_FILE" >/dev/null
+    say "log out and pick 'Noir (development build)' at the login screen; it runs the build tree,"
+    say "so rebuilding is enough to try new code at the next login"
+}
+
+cmd_remove_session() {
+    if [[ -e $XSESSION_FILE ]]; then
+        sudo rm -f "$XSESSION_FILE"
+        say "removed $XSESSION_FILE"
+    else
+        say "no development session entry installed"
+    fi
+}
+
+command=${1:-help}
+shift || true
+case $command in
+    start) cmd_start "$@" ;;
+    restart) cmd_restart "$@" ;;
+    stop) cmd_stop ;;
+    status) cmd_status ;;
+    logs) cmd_logs "$@" ;;
+    shot) cmd_shot "$@" ;;
+    run) cmd_run "$@" ;;
+    env) cmd_env ;;
+    install-session) cmd_install_session ;;
+    remove-session) cmd_remove_session ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac

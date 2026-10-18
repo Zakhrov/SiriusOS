@@ -12,8 +12,9 @@ networking, and state under `build/vm/`.
 
 ## Requirements
 
-Host: `qemu-system-x86_64` with access to `/dev/kvm` and, for 3D, to a DRM
-render node (`/dev/dri/renderD*`); `qemu-img`, `curl`, `ssh`, `python3`, and
+Host: `qemu-system-x86_64` with access to `/dev/kvm` and, for Venus, QEMU
+9.2 or later built against a Venus-enabled virglrenderer, plus a DRM render
+node (`/dev/dri/renderD*`); `qemu-img`, `curl`, `ssh`, `python3`, and
 `xorriso` or `mkisofs`. A VNC viewer (`vncviewer`,
 `remote-viewer`) to watch the guest.
 
@@ -50,28 +51,33 @@ forwarded on loopback.
   `/usr/share/xsessions/noir.desktop`, installed by `cmake --install`.
   LightDM logs `noir` in automatically and starts that session.
 - **Packages** (see `GUEST_PACKAGES` in the script): X.Org server and
-  libinput, LightDM, Mesa with the lavapipe software Vulkan driver, the Qt 6
-  runtime the shell links against, fonts and icon themes, and a few clients
-  (`xterm`, `xclock`, `xeyes`, `notify-send`).
+  libinput, LightDM, Mesa with the lavapipe software Vulkan driver (and its
+  Venus driver where the distribution packages it), the Qt 6
+  runtime the shell and the Control Center link against, the helpers and
+  services the Control Center uses (`setxkbmap`, `pactl`, UPower,
+  `xdg-utils`), fonts and icon themes, and a few clients (`xterm`, `xclock`,
+  `xeyes`, `notify-send`).
 - **`/etc/noir/session.conf`**: starts the shell with `--debug-interface` so
   the host can inspect it.
 
 ### Rendering
 
-The guest has a `virtio-vga-gl` adapter: virtio-gpu with 3D (virgl), so
-OpenGL in the guest is executed by the host GPU and the guest X server gets
-glamor acceleration and DRI3. Vulkan in the guest is Mesa's lavapipe, on the
-CPU (QEMU 8.2 has no Vulkan passthrough).
+The Noir stack renders with Vulkan only. How the guest gets it depends on
+the host QEMU (`NOIR_VM_VENUS`, default `auto`):
 
-| Component | Renders with |
-| --- | --- |
-| X server | glamor on virgl (host GPU) |
-| NoirWM compositor | Vulkan on lavapipe |
-| NoirShell | OpenGL on virgl. Software Vulkan cannot present translucent windows, so the shell picks OpenGL when a compositor is running |
-| OpenGL applications | virgl |
+| | Venus available | Otherwise (QEMU 8.2 on Leap 15.6, for one) |
+| --- | --- | --- |
+| Adapter | `virtio-vga-gl` with `venus=true,blob=true` | Plain `virtio-vga` framebuffer, no 3D |
+| Guest Vulkan | Mesa's Venus driver, executed by the host GPU's Vulkan driver | lavapipe, on the guest CPU |
+| X server | glamor (DRI3) on the virtio-gpu | Unaccelerated |
+| NoirWM compositor, NoirShell | Venus | lavapipe; shell surfaces stay opaque, because software Vulkan cannot present to ARGB windows |
 
-`noir-vm status` shows what is actually in use. `NOIR_VM_GL=0 noir-vm start`
-boots with a plain framebuffer instead: no DRI3, everything on the guest CPU.
+`auto` uses Venus when `qemu-system-x86_64 -device virtio-vga-gl,help` lists
+a `venus` property and the host has a render node; `start` says which one it
+picked and `noir-vm status` shows the guest's Vulkan devices. The guest also
+needs Mesa's Venus driver, which is installed when the distribution ships it
+(Leap 15.6 does not), so with Venus on the host the shell may still end up on
+lavapipe. `NOIR_VM_VENUS=1` insists on Venus, `0` never uses it.
 
 ## Looking and poking
 
@@ -107,7 +113,8 @@ that QEMU cannot dump, grabs the X screen from inside the guest instead.
 | `NOIR_VM_DISK_SIZE` | `12G` | Virtual size of the copy-on-write disk |
 | `NOIR_VM_SSH_PORT` | `2226` | Host loopback port forwarded to the guest's sshd |
 | `NOIR_VM_VNC_DISPLAY` | `26` | VNC on TCP port 5900 + N, loopback only, no password |
-| `NOIR_VM_GL` | `1` | `0` turns virtio-gpu 3D off |
+| `NOIR_VM_VENUS` | `auto` | `1`: virtio-gpu Venus or fail; `0`: lavapipe only |
+| `NOIR_VM_HOSTMEM` | `4G` | Host memory window for Venus blob resources |
 | `NOIR_VM_DIR` | `build/vm` | Disk, seed, key, logs, screenshots |
 
 Change the session inside the guest by editing `/etc/noir/session.conf`
@@ -128,8 +135,13 @@ Change the session inside the guest by editing `/etc/noir/session.conf`
 - The compositor runs on the guest CPU and reads window contents back from
   the X server, so an animating desktop keeps NoirWM at roughly one core.
   Turning on *Reduce Motion* in the desktop's context menu quiets it.
-- The guest's X server (xorg-server 21.1.11, glamor on virgl) aborts when a
+- With Venus, the guest's X server (xorg-server 21.1.11, glamor) may abort when a
   depth-32 window exactly the size of the screen is mapped while compositing.
   NoirShell keeps its desktop surface opaque, and framed application windows
   are not affected, but a frameless full-screen ARGB client would hit it.
 - The VDD's window animations are not implemented.
+- The guest has no sound card or sound server, and networking is wicked
+  rather than NetworkManager, so the Control Center's Sound page reports no
+  sound server and its Network page lists the interfaces read-only. Display,
+  Input Devices, Power (screen blanking, session actions), Graphics and the
+  rest work, and the virtio-vga adapter offers many display modes to try.

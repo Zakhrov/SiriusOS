@@ -194,6 +194,17 @@ void handle_event(NoirWM* wm, XEvent* event) {
     case KeyPress:
         handle_key_press(wm, &event->xkey);
         break;
+    case ConfigureNotify:
+        // The screen changed size (a new display mode): follow it.
+        if (event->xconfigure.window == wm->root
+            && (event->xconfigure.width != wm->screenWidth || event->xconfigure.height != wm->screenHeight)) {
+            wm->screenWidth = event->xconfigure.width;
+            wm->screenHeight = event->xconfigure.height;
+            const long geometry[2] = { wm->screenWidth, wm->screenHeight };
+            ewmh_set_cardinals(wm->display, wm->root, noirAtoms[NET_DESKTOP_GEOMETRY], geometry, 2);
+            wm_update_workarea(wm);
+        }
+        break;
     default:
         break;
     }

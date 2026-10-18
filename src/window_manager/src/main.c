@@ -9,10 +9,13 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--no-compositor") == 0) {
             useCompositor = 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            printf("Usage: %s [--no-compositor]\n"
+            printf("Usage: %s [--no-compositor] [--version]\n"
                    "  --no-compositor  manage windows without the Vulkan compositor\n"
                    "The compositor is also skipped, with a message, when Vulkan cannot\n"
                    "present to the X server.\n", argv[0]);
+            return EXIT_SUCCESS;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("NoirWM %s\n", NOIR_VERSION);
             return EXIT_SUCCESS;
         }
     }

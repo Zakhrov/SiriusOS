@@ -1,5 +1,6 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 // One notification: glass card with app line, summary, body, optional
 // progress and action buttons. Click (or Enter) dismisses; Delete closes.
@@ -79,7 +80,7 @@ FocusScope {
                 anchors.centerIn: parent
                 visible: !icon.visible
                 size: 20
-                source: "icons/noir-bell.svg"
+                source: Theme.icon("bell")
             }
         }
 

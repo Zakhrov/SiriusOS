@@ -1,5 +1,6 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 // Desktop launcher: a bevelled black tile with a silver SVG glyph that
 // inverts when selected and sinks when opened.

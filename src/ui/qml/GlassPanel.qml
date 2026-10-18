@@ -1,5 +1,5 @@
 import QtQuick
-import Noir.Shell
+import Noir.Ui
 
 // Sharp-edged black glass surface: translucent fill, silver hairline edge,
 // a faint top sheen and an optional layered drop shadow.
@@ -33,6 +33,11 @@ Item {
         border.color: panel.edgeColor
         border.width: panel.edgeWidth
         radius: Theme.radius
+    }
+
+    GlassReflection {
+        visible: panel.sheen
+        anchors { fill: parent; margins: panel.edgeWidth }
     }
 
     Rectangle {

@@ -1,6 +1,6 @@
 import QtQuick
 import QtQuick.Window
-import Noir.Shell
+import Noir.Ui
 
 // Tooltip hosted in its own override-redirect window so it can extend beyond
 // the (thin) taskbar surface. Pops up with a 3D tilt and a slight bounce.

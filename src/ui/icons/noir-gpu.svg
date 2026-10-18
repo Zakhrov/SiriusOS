@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="#ffffff">
+<path fill-rule="evenodd" d="M1,5 L21,5 L21,18 L1,18 Z M3,7 L3,16 L19,16 L19,7 Z"/>
+<polygon points="21,8 23,8 23,15 21,15"/>
+<polygon points="3,18 9,18 9,21 3,21"/>
+<path fill-rule="evenodd" d="M9,8 L13,8 L15,10 L15,13 L13,15 L9,15 L7,13 L7,10 Z M10,10 L10,13 L12,13 L12,10 Z"/>
+<polygon points="16,8 18,8 18,15 16,15" fill-opacity="0.6"/>
+</svg>

@@ -1,5 +1,5 @@
 import QtQuick
-import Noir.Shell
+import Noir.Ui
 
 // Recessed groove with a bevelled silver fill that glides to its new value,
 // plus an optional percentage readout.

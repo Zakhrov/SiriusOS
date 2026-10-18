@@ -9,10 +9,10 @@ through Qt Quick's **Vulkan** RHI on **X11**.
 
 | Surface | Details |
 | --- | --- |
-| Desktop | Black-to-graphite wallpaper with a receding silver perspective grid; bevelled 3D launcher icons (Home, Terminal, Settings, Trash); glass context menu on right-click / Menu key / Shift+F10 |
+| Desktop | Black-to-graphite wallpaper with a receding silver perspective grid; bevelled 3D launcher icons (Home, Terminal, Settings, Trash); glass context menu on right-click / Menu key / Shift+F10, with shortcuts into the Control Center |
 | Desktop widgets | Chamfered-polygon glass widgets (Chronometer, System monitor with CPU trace and memory gauge) that float with a slow bob and a counter-moving soft shadow; draggable |
-| Taskbar | Black-glass bar at the bottom: start button, live task list (EWMH), system tray (network, volume, battery, notification counter) and clock in the bottom-right corner |
-| Start menu | Glass launcher that folds up out of the taskbar in 3D; lists XDG `.desktop` applications, type-to-search, arrow keys + Enter, power menu |
+| Taskbar | Black-glass bar at the bottom: start button, live task list (EWMH), system tray (network, volume, battery, notification counter) and clock in the bottom-right corner. The tray icons and the clock open the matching Control Center page |
+| Start menu | Glass launcher that folds up out of the taskbar in 3D; lists XDG `.desktop` applications, type-to-search, arrow keys + Enter, Control Center and power menu |
 | Notifications | `org.freedesktop.Notifications` D-Bus server; cards slide and swing in from the bottom right and slide out when dismissed; actions, urgency and progress (`value` hint) supported |
 | Tooltips | Own override-redirect windows so they can rise above the taskbar; pop up with a 3D tilt and a bounce |
 
@@ -23,11 +23,21 @@ Design rules carried over from the VDD:
 - Interactive elements **invert** (white background, black foreground) on hover
   *and* on keyboard focus.
 - Buttons and menu items have a 3D press (the face sinks and its bevel flips).
-- First-party icons are monochrome SVGs in [`icons/`](icons); facet depth is
-  encoded in opacity so they keep their 3D shading when tinted silver or black.
-  Third-party application icons are shown untouched.
-- Everything is reachable from the keyboard. `Theme.reducedMotion` (toggle
-  from the desktop context menu) collapses all animations.
+- First-party icons are monochrome SVGs in [`src/ui/icons/`](../ui/icons);
+  facet depth is encoded in opacity so they keep their 3D shading when tinted
+  silver or black. Third-party application icons are shown untouched.
+- Everything is reachable from the keyboard. Reduce motion (desktop context
+  menu, or Control Center > Appearance) collapses all animations.
+
+## Settings
+
+The shell reads its settings from `NoirConfig` (`~/.config/SiriusOS/Noir.ini`,
+see [`src/ui`](../ui/src/NoirConfig.h)) and follows changes live, so whatever
+the [Control Center](../control_center/README.md) changes shows up at once:
+reduced motion and animation speed, glass opacity, desktop icons, widgets and
+grid, the clock format, do not disturb (cards stay off the screen, the bell
+still counts them), how long notifications stay, and the terminal used by the
+Terminal launcher and by terminal applications.
 
 ## Layout
 
@@ -41,9 +51,12 @@ src/shell/
 │   ├── SystemMonitor.*      /proc and /sys poller (CPU, memory, battery, net)
 │   ├── DebugInterface.*     org.siriusos.NoirShell.Debug (--debug-interface)
 │   └── NotificationServer.* org.freedesktop.Notifications server + model
-├── qml/                     UI (Theme singleton + components)
-└── icons/                   first-party SVG icons
+└── qml/                     the shell's surfaces and widgets
 ```
+
+The theme, the shared controls (buttons, tooltips, menus, switches, sliders,
+drop-downs, ...), the icons, `NoirConfig` and the Vulkan setup live in the
+`Noir.Ui` module in [`src/ui`](../ui), which the Control Center uses too.
 
 `Main.qml` picks a host:
 
@@ -84,23 +97,55 @@ activate, `Esc` closes menus, `Delete` dismisses a focused notification.
 In the taskbar, clicking the active task minimizes it and middle-click closes
 it.
 
-`--backend vulkan|opengl|software` picks the renderer (the `QSG_RHI_BACKEND`
-environment variable is honoured too). The default, `auto`, picks:
+The shell renders with Vulkan only; there is no OpenGL or raster fallback,
+and `QSG_RHI_BACKEND` / `QT_QUICK_BACKEND` are ignored. Like the rest of the
+stack it targets Vulkan 1.0, so it runs on the widest range of hardware. It
+creates its own Vulkan 1.0 `QVulkanInstance` and hands it, with the chosen
+device, to every window as its platform window is created. Without a Vulkan
+device that can present to the X server, it exits.
 
-| Situation | Renderer |
+The device is chosen by the same code NoirWM's compositor uses
+([`src/vulkan_device`](../vulkan_device/include/NoirVulkanDevice.h)), so the
+two always share a GPU. Among the devices that can render and present to
+the X server, it takes, in order:
+
+1. the one `NOIR_VK_DEVICE` names: a substring of the device name
+   (`NOIR_VK_DEVICE=renoir`) or an index in enumeration order;
+2. the one driving the X server: the device node DRI3 hands out, matched
+   with `VK_EXT_physical_device_drm` (skipped when the loader lacks
+   `VK_KHR_get_physical_device_properties2`, which a 1.0 instance needs to
+   query it);
+3. the best device type (discrete, integrated, virtual, other, CPU), then the
+   lowest vendor and device ID.
+
+| Device | Presentation |
 | --- | --- |
-| Hardware Vulkan device and an X server with DRI3 | Vulkan |
-| Only a software Vulkan device (lavapipe), no compositor | Vulkan on the CPU |
-| Only a software Vulkan device, compositor running | OpenGL, because Mesa's software Vulkan cannot present to ARGB windows |
-| No usable Vulkan device | OpenGL |
+| GPU, X server with DRI3 (virtio-gpu Venus in a VM included) | Direct; translucent surfaces when a compositor runs |
+| GPU, X server without DRI3 (Xvfb with `MESA_VK_WSI_DEBUG=sw`) | Frames copied to the server; surfaces stay opaque |
+| CPU (lavapipe) | Frames copied to the server; surfaces stay opaque, because Mesa's software presentation cannot target ARGB windows |
 
-The choice is logged at startup, and `QSG_INFO=1` prints the full renderer
-details.
+The choice and the rule that decided it are logged at startup, and
+`QSG_INFO=1` prints the full renderer details. `NOIR_VK_VALIDATION=1`
+enables the validation layer.
 
 The taskbar, start menu and notification surfaces ask for a translucent
 (ARGB) window only when a compositing manager owns `_NET_WM_CM_S0` and the
 renderer can present to one; otherwise they are opaque black around their
 content. The desktop surface is always opaque.
+
+### Glass
+
+Glass surfaces take their density from Control Center > Appearance (Glass
+opacity) and are **frosted** unless Blur behind glass is off:
+
+| Surface | What shows through | Blurred by |
+| --- | --- | --- |
+| Taskbar, start menu, notification cards | The windows behind them | NoirWM's compositor: the shell sets KDE's `_KDE_NET_WM_BLUR_BEHIND_REGION` on those windows (`X11Integration.setBlurBehind`), for the card rectangles only, so the gaps between cards stay clear |
+| Desktop widgets | The wallpaper (windows never go behind them) | The shell itself (MultiEffect on the wallpaper, cut to the widget's chamfered outline) |
+
+Every pane also carries a diagonal reflection (`GlassReflection`), which is
+what makes black glass read as glass even over black. The wallpaper has a
+faint silver haze in the sky for the widgets' glass to catch.
 
 ## Headless inspection and debugging
 
@@ -166,6 +211,6 @@ implemented yet.
 - Global `Super` key grab in session mode
 - XEmbed / StatusNotifierItem tray icons for third-party applications
 - Workspace switcher (backed by `_NET_NUMBER_OF_DESKTOPS` / `_NET_CURRENT_DESKTOP`)
-- Volume control, calendar popup and a notification history panel
+- Quick volume popup, calendar popup and a notification history panel
 - Audio cues listed in the VDD
 - Multi-monitor: one desktop and taskbar per screen

@@ -6,6 +6,7 @@ layout(push_constant) uniform Push {
     vec2 screen;
     float mode;
     float opacity;
+    vec4 uvRect;
 } pc;
 
 layout(set = 0, binding = 0) uniform sampler2D windowTexture;
@@ -17,7 +18,7 @@ void main() {
     if (pc.mode > 1.5) {
         // Soft drop shadow: darkness falls off with the distance from the
         // window rectangle, across a margin as wide as params.x.
-        vec2 p = uv * pc.rect.zw;
+        vec2 p = (uv - pc.uvRect.xy) / pc.uvRect.zw * pc.rect.zw;
         vec2 lo = pc.params.xy;
         vec2 hi = pc.params.xy + pc.params.zw;
         float dist = length(max(max(lo - p, p - hi), vec2(0.0)));

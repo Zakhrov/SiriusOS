@@ -1,5 +1,7 @@
 #include "VulkanRenderer.h"
+#include "NoirVulkanDevice.h"
 
+#include <X11/Xlib-xcb.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_xlib.h>
 
@@ -12,6 +14,8 @@
 
 #define TEXTURE_FORMAT VK_FORMAT_B8G8R8A8_UNORM   // X11 ZPixmap byte order
 #define MAX_TEXTURES 1024
+#define BLUR_LEVELS 4        // 1/2 .. 1/16 of the screen
+#define BLUR_MARGIN 64       // pixels around a blurred area that feed into it
 
 struct RendererTexture {
     int width, height;
@@ -33,7 +37,16 @@ typedef struct {
     float screen[2];
     float mode;
     float opacity;
+    float uvRect[4];
 } PushConstants;
+
+// A screen-sized image the compositor renders or blurs into.
+typedef struct {
+    VkImage image;
+    VkDeviceMemory memory;
+    VkImageView view;
+    uint32_t width, height;
+} OffscreenImage;
 
 struct VulkanRenderer {
     Display* display;
@@ -68,6 +81,23 @@ struct VulkanRenderer {
     RendererTexture* blank;        // bound while drawing untextured quads
     RendererTexture** dirty;
     int dirtyCount, dirtyCapacity;
+
+    // Blur behind. Frames that need it are drawn into `scene` instead of the
+    // swapchain; for each blurred area the scene so far is copied out through
+    // a chain of half-size linear blits and back up (a cheap, smooth blur),
+    // drawn back under the window, and the finished scene is then drawn to
+    // the swapchain. Frames without blur go straight to the swapchain.
+    int blurSupported;
+    VkRenderPass scenePassClear;   // UNDEFINED -> TRANSFER_SRC, starts cleared
+    VkRenderPass scenePassLoad;    // COLOR_ATTACHMENT -> TRANSFER_SRC, keeps contents
+    VkSampler linearSampler;
+    OffscreenImage scene;
+    OffscreenImage levels[BLUR_LEVELS];   // kept in VK_IMAGE_LAYOUT_GENERAL
+    int levelsReady;
+    VkFramebuffer sceneFramebuffer;
+    VkDescriptorSet sceneDescriptor;
+    VkDescriptorSet blurDescriptor;
+    int offscreen;                 // this frame draws into `scene`
 };
 
 #define CHECK(call, message) \
@@ -78,11 +108,12 @@ struct VulkanRenderer {
 static int create_instance(VulkanRenderer* r) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "NoirCompositor",
-                              .apiVersion = VK_API_VERSION_1_0 };
-    const char* extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
+                              .apiVersion = NOIR_VK_API_VERSION };
+    const char* extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_XLIB_SURFACE_EXTENSION_NAME,
+                                 NOIR_VK_INSTANCE_EXTENSION };
     VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
                                   .pApplicationInfo = &app,
-                                  .enabledExtensionCount = 2,
+                                  .enabledExtensionCount = noir_vk_has_instance_extension() ? 3 : 2,
                                   .ppEnabledExtensionNames = extensions };
     // Validation is opt-in: the layer is a development package.
     const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
@@ -94,48 +125,26 @@ static int create_instance(VulkanRenderer* r) {
     return 1;
 }
 
-// First device with a queue family that can both render and present to the
-// surface. NOIR_VK_DEVICE=<index> picks a specific one.
+static int presents_to_surface(VkPhysicalDevice device, uint32_t family, void* user) {
+    VkSurfaceKHR surface = *(VkSurfaceKHR*)user;
+    VkBool32 canPresent = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(device, family, surface, &canPresent);
+    uint32_t formats = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formats, NULL);
+    return canPresent && formats > 0;
+}
+
+// The same device as the rest of the Noir stack (see NoirVulkanDevice.h).
 static int pick_device(VulkanRenderer* r) {
-    uint32_t count = 0;
-    vkEnumeratePhysicalDevices(r->instance, &count, NULL);
-    if (count == 0) {
-        fprintf(stderr, "NoirCompositor: no Vulkan devices\n");
+    NoirVkChoice choice;
+    if (!noir_vk_choose_device(r->instance, XGetXCBConnection(r->display), DefaultRootWindow(r->display),
+                               presents_to_surface, &r->surface, "NoirCompositor", &choice)) {
         return 0;
     }
-    VkPhysicalDevice* devices = malloc(sizeof(VkPhysicalDevice) * count);
-    vkEnumeratePhysicalDevices(r->instance, &count, devices);
-    const char* wanted = getenv("NOIR_VK_DEVICE");
-    int found = 0;
-    for (uint32_t d = 0; d < count && !found; d++) {
-        if (wanted && (uint32_t)atoi(wanted) != d) {
-            continue;
-        }
-        uint32_t familyCount = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(devices[d], &familyCount, NULL);
-        VkQueueFamilyProperties* families = malloc(sizeof(VkQueueFamilyProperties) * familyCount);
-        vkGetPhysicalDeviceQueueFamilyProperties(devices[d], &familyCount, families);
-        for (uint32_t f = 0; f < familyCount && !found; f++) {
-            VkBool32 canPresent = VK_FALSE;
-            vkGetPhysicalDeviceSurfaceSupportKHR(devices[d], f, r->surface, &canPresent);
-            uint32_t formats = 0;
-            vkGetPhysicalDeviceSurfaceFormatsKHR(devices[d], r->surface, &formats, NULL);
-            if ((families[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) && canPresent && formats > 0) {
-                r->physicalDevice = devices[d];
-                r->queueFamily = f;
-                found = 1;
-            }
-        }
-        free(families);
-    }
-    free(devices);
-    if (!found) {
-        fprintf(stderr, "NoirCompositor: no Vulkan device can present to this X server\n");
-        return 0;
-    }
-    VkPhysicalDeviceProperties properties;
-    vkGetPhysicalDeviceProperties(r->physicalDevice, &properties);
-    snprintf(r->deviceName, sizeof(r->deviceName), "%s", properties.deviceName);
+    r->physicalDevice = choice.device;
+    r->queueFamily = choice.queueFamily;
+    snprintf(r->deviceName, sizeof(r->deviceName), "%s", choice.properties.deviceName);
+    fprintf(stderr, "NoirCompositor: using %s (%s)\n", choice.properties.deviceName, choice.reason);
     vkGetPhysicalDeviceMemoryProperties(r->physicalDevice, &r->memoryProperties);
     return 1;
 }
@@ -185,7 +194,10 @@ static uint32_t find_memory_type(VulkanRenderer* r, uint32_t typeBits, VkMemoryP
 
 // --- swapchain ---------------------------------------------------------------
 
+static void destroy_blur_targets(VulkanRenderer* r);
+
 static void destroy_swapchain(VulkanRenderer* r) {
+    destroy_blur_targets(r);
     for (uint32_t i = 0; i < r->imageCount; i++) {
         if (r->framebuffers && r->framebuffers[i]) vkDestroyFramebuffer(r->device, r->framebuffers[i], NULL);
         if (r->imageViews && r->imageViews[i]) vkDestroyImageView(r->device, r->imageViews[i], NULL);
@@ -223,7 +235,30 @@ static int create_render_pass(VulkanRenderer* r) {
                                     .subpassCount = 1, .pSubpasses = &subpass,
                                     .dependencyCount = 1, .pDependencies = &dependency };
     CHECK(vkCreateRenderPass(r->device, &info, NULL, &r->renderPass), "cannot create the render pass");
+    if (!r->blurSupported) {
+        return 1;
+    }
+    // Same format as the swapchain, so the one pipeline serves both.
+    color.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    CHECK(vkCreateRenderPass(r->device, &info, NULL, &r->scenePassClear), "cannot create the scene render pass");
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    CHECK(vkCreateRenderPass(r->device, &info, NULL, &r->scenePassLoad), "cannot create the scene render pass");
     return 1;
+}
+
+// Blur needs the output format to be blittable with linear filtering.
+static void check_blur_support(VulkanRenderer* r) {
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(r->physicalDevice, r->surfaceFormat.format, &props);
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT
+        | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+        | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    r->blurSupported = (props.optimalTilingFeatures & needed) == needed && !getenv("NOIR_NO_BLUR");
+    if (!r->blurSupported) {
+        fprintf(stderr, "NoirCompositor: blur behind windows is off%s\n",
+                getenv("NOIR_NO_BLUR") ? " (NOIR_NO_BLUR)" : " (the output format cannot be blitted)");
+    }
 }
 
 static int choose_surface_format(VulkanRenderer* r) {
@@ -244,6 +279,84 @@ static int choose_surface_format(VulkanRenderer* r) {
         }
     }
     free(formats);
+    return 1;
+}
+
+static void destroy_offscreen(VulkanRenderer* r, OffscreenImage* o) {
+    if (o->view) vkDestroyImageView(r->device, o->view, NULL);
+    if (o->image) vkDestroyImage(r->device, o->image, NULL);
+    if (o->memory) vkFreeMemory(r->device, o->memory, NULL);
+    memset(o, 0, sizeof(*o));
+}
+
+static int create_offscreen(VulkanRenderer* r, OffscreenImage* o, uint32_t width, uint32_t height,
+                            VkImageUsageFlags usage) {
+    o->width = width ? width : 1;
+    o->height = height ? height : 1;
+    VkImageCreateInfo imageInfo = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                                    .imageType = VK_IMAGE_TYPE_2D,
+                                    .format = r->surfaceFormat.format,
+                                    .extent = { o->width, o->height, 1 },
+                                    .mipLevels = 1, .arrayLayers = 1,
+                                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                    .usage = usage,
+                                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    CHECK(vkCreateImage(r->device, &imageInfo, NULL, &o->image), "cannot create an offscreen image");
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(r->device, o->image, &req);
+    VkMemoryAllocateInfo alloc = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                   .allocationSize = req.size,
+                                   .memoryTypeIndex = find_memory_type(r, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
+    if (alloc.memoryTypeIndex == UINT32_MAX) alloc.memoryTypeIndex = find_memory_type(r, req.memoryTypeBits, 0);
+    CHECK(vkAllocateMemory(r->device, &alloc, NULL, &o->memory), "cannot allocate an offscreen image");
+    vkBindImageMemory(r->device, o->image, o->memory, 0);
+    VkImageViewCreateInfo viewInfo = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                       .image = o->image,
+                                       .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                       .format = r->surfaceFormat.format,
+                                       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    CHECK(vkCreateImageView(r->device, &viewInfo, NULL, &o->view), "cannot create an offscreen image view");
+    return 1;
+}
+
+static void write_descriptor(VulkanRenderer* r, VkDescriptorSet set, VkSampler sampler, VkImageView view,
+                             VkImageLayout layout) {
+    VkDescriptorImageInfo image = { sampler, view, layout };
+    VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                   .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+                                   .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                   .pImageInfo = &image };
+    vkUpdateDescriptorSets(r->device, 1, &write, 0, NULL);
+}
+
+static void destroy_blur_targets(VulkanRenderer* r) {
+    if (r->sceneFramebuffer) vkDestroyFramebuffer(r->device, r->sceneFramebuffer, NULL);
+    r->sceneFramebuffer = VK_NULL_HANDLE;
+    destroy_offscreen(r, &r->scene);
+    for (int i = 0; i < BLUR_LEVELS; i++) destroy_offscreen(r, &r->levels[i]);
+    r->levelsReady = 0;
+}
+
+// The scene and the blur pyramid, sized to the swapchain.
+static int create_blur_targets(VulkanRenderer* r) {
+    if (!r->blurSupported) return 1;
+    const uint32_t w = r->extent.width, h = r->extent.height;
+    if (!create_offscreen(r, &r->scene, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                          | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return 0;
+    for (int i = 0; i < BLUR_LEVELS; i++) {
+        const uint32_t s = 1u << (i + 1);
+        if (!create_offscreen(r, &r->levels[i], (w + s - 1) / s, (h + s - 1) / s, VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                              | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
+    }
+    VkFramebufferCreateInfo fbInfo = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                       .renderPass = r->scenePassClear,
+                                       .attachmentCount = 1, .pAttachments = &r->scene.view,
+                                       .width = w, .height = h, .layers = 1 };
+    CHECK(vkCreateFramebuffer(r->device, &fbInfo, NULL, &r->sceneFramebuffer), "cannot create the scene framebuffer");
+    write_descriptor(r, r->sceneDescriptor, r->sampler, r->scene.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    write_descriptor(r, r->blurDescriptor, r->linearSampler, r->levels[0].view, VK_IMAGE_LAYOUT_GENERAL);
+    r->levelsReady = 0;
     return 1;
 }
 
@@ -301,6 +414,11 @@ static int create_swapchain(VulkanRenderer* r) {
                                            .layers = 1 };
         CHECK(vkCreateFramebuffer(r->device, &fbInfo, NULL, &r->framebuffers[i]), "cannot create a framebuffer");
     }
+    if (!create_blur_targets(r)) {
+        fprintf(stderr, "NoirCompositor: blur behind windows is off (no memory for its images)\n");
+        destroy_blur_targets(r);
+        r->blurSupported = 0;
+    }
     return 1;
 }
 
@@ -308,6 +426,12 @@ static int recreate_swapchain(VulkanRenderer* r) {
     vkDeviceWaitIdle(r->device);
     destroy_swapchain(r);
     return create_swapchain(r);
+}
+
+void renderer_resize(VulkanRenderer* r) {
+    if (!recreate_swapchain(r)) {
+        fprintf(stderr, "NoirCompositor: could not resize the swapchain\n");
+    }
 }
 
 // --- pipeline ----------------------------------------------------------------
@@ -345,6 +469,19 @@ static int create_pipeline(VulkanRenderer* r) {
                                         .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                         .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
     CHECK(vkCreateSampler(r->device, &samplerInfo, NULL, &r->sampler), "cannot create the sampler");
+    // The blurred backdrop is stretched back up: smooth sampling.
+    samplerInfo.magFilter = samplerInfo.minFilter = VK_FILTER_LINEAR;
+    CHECK(vkCreateSampler(r->device, &samplerInfo, NULL, &r->linearSampler), "cannot create the sampler");
+    if (r->blurSupported) {
+        const VkDescriptorSetLayout layouts[2] = { r->descriptorLayout, r->descriptorLayout };
+        VkDescriptorSet sets[2];
+        VkDescriptorSetAllocateInfo setInfo = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                                .descriptorPool = r->descriptorPool,
+                                                .descriptorSetCount = 2, .pSetLayouts = layouts };
+        CHECK(vkAllocateDescriptorSets(r->device, &setInfo, sets), "cannot allocate descriptor sets");
+        r->sceneDescriptor = sets[0];
+        r->blurDescriptor = sets[1];
+    }
 
     VkPushConstantRange pushRange = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                       0, sizeof(PushConstants) };
@@ -578,7 +715,20 @@ static void upload_dirty_textures(VulkanRenderer* r) {
 
 // --- frames ------------------------------------------------------------------
 
-int renderer_begin_frame(VulkanRenderer* r) {
+static void draw_quad_set(VulkanRenderer* r, VkDescriptorSet set, const PushConstants* push);
+
+static void set_full_viewport(VulkanRenderer* r) {
+    VkViewport viewport = { 0.0f, 0.0f, (float)r->extent.width, (float)r->extent.height, 0.0f, 1.0f };
+    VkRect2D scissor = { { 0, 0 }, r->extent };
+    vkCmdSetViewport(r->commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(r->commandBuffer, 0, 1, &scissor);
+}
+
+int renderer_blur_supported(const VulkanRenderer* r) {
+    return r->blurSupported;
+}
+
+int renderer_begin_frame(VulkanRenderer* r, int offscreen) {
     // One frame in flight: after this wait the staging buffers are ours again.
     vkWaitForFences(r->device, 1, &r->inFlight, VK_TRUE, UINT64_MAX);
 
@@ -600,27 +750,134 @@ int renderer_begin_frame(VulkanRenderer* r) {
     vkBeginCommandBuffer(cb, &beginInfo);
     upload_dirty_textures(r);
 
+    r->offscreen = offscreen && r->blurSupported && r->sceneFramebuffer;
+    if (r->offscreen && !r->levelsReady) {
+        // The blur pyramid lives in GENERAL: blit source, blit target and sampled.
+        for (int i = 0; i < BLUR_LEVELS; i++) {
+            image_barrier(cb, r->levels[i].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                          0, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        }
+        r->levelsReady = 1;
+    }
+
     VkClearValue clear = { .color = { { 0.0f, 0.0f, 0.0f, 1.0f } } };
     VkRenderPassBeginInfo passInfo = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                                       .renderPass = r->renderPass,
-                                       .framebuffer = r->framebuffers[r->imageIndex],
+                                       .renderPass = r->offscreen ? r->scenePassClear : r->renderPass,
+                                       .framebuffer = r->offscreen ? r->sceneFramebuffer : r->framebuffers[r->imageIndex],
                                        .renderArea = { { 0, 0 }, r->extent },
                                        .clearValueCount = 1, .pClearValues = &clear };
     vkCmdBeginRenderPass(cb, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipeline);
-    VkViewport viewport = { 0.0f, 0.0f, (float)r->extent.width, (float)r->extent.height, 0.0f, 1.0f };
-    VkRect2D scissor = { { 0, 0 }, r->extent };
-    vkCmdSetViewport(cb, 0, 1, &viewport);
-    vkCmdSetScissor(cb, 0, 1, &scissor);
+    set_full_viewport(r);
     return 1;
 }
 
-static void draw_quad(VulkanRenderer* r, RendererTexture* texture, const PushConstants* push) {
+// The box `box` (x0, y0, x1, y1 in full-size pixels) at a level `shift`
+// times halved, rounded outwards and clamped to the image.
+static void scaled_box(const int box[4], int shift, const OffscreenImage* image, int out[4]) {
+    const int s = 1 << shift;
+    out[0] = box[0] / s;
+    out[1] = box[1] / s;
+    out[2] = (box[2] + s - 1) / s;
+    out[3] = (box[3] + s - 1) / s;
+    if (out[2] > (int)image->width) out[2] = (int)image->width;
+    if (out[3] > (int)image->height) out[3] = (int)image->height;
+    if (out[2] <= out[0]) out[2] = out[0] + 1;
+    if (out[3] <= out[1]) out[3] = out[1] + 1;
+}
+
+static void blit_box(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout, const int from[4],
+                     VkImage dst, const int to[4]) {
+    VkImageBlit region = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                           .srcOffsets = { { from[0], from[1], 0 }, { from[2], from[3], 1 } },
+                           .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                           .dstOffsets = { { to[0], to[1], 0 }, { to[2], to[3], 1 } } };
+    vkCmdBlitImage(cb, src, srcLayout, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_LINEAR);
+}
+
+static void memory_barrier(VkCommandBuffer cb, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                           VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+    VkMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                .srcAccessMask = srcAccess, .dstAccessMask = dstAccess };
+    vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+void renderer_draw_blur(VulkanRenderer* r, int x, int y, int width, int height) {
+    if (!r->offscreen) {
+        return;
+    }
+    const int W = (int)r->extent.width, H = (int)r->extent.height;
+    const int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    const int x1 = x + width > W ? W : x + width, y1 = y + height > H ? H : y + height;
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    // What lies just outside the area bleeds into its edges, as in real glass.
+    const int box[4] = { x0 - BLUR_MARGIN < 0 ? 0 : x0 - BLUR_MARGIN, y0 - BLUR_MARGIN < 0 ? 0 : y0 - BLUR_MARGIN,
+                         x1 + BLUR_MARGIN > W ? W : x1 + BLUR_MARGIN, y1 + BLUR_MARGIN > H ? H : y1 + BLUR_MARGIN };
+    VkCommandBuffer cb = r->commandBuffer;
+    vkCmdEndRenderPass(cb);   // the scene is now TRANSFER_SRC_OPTIMAL
+
+    // An earlier blur in this frame may still be reading level 0.
+    memory_barrier(cb, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    int boxes[BLUR_LEVELS + 1][4];
+    memcpy(boxes[0], box, sizeof(box));
+    for (int i = 0; i < BLUR_LEVELS; i++) {
+        scaled_box(box, i + 1, &r->levels[i], boxes[i + 1]);
+    }
+    // Down: each level half the size of the one before...
+    for (int i = 0; i < BLUR_LEVELS; i++) {
+        if (i == 0) {
+            blit_box(cb, r->scene.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, boxes[0], r->levels[0].image, boxes[1]);
+        } else {
+            blit_box(cb, r->levels[i - 1].image, VK_IMAGE_LAYOUT_GENERAL, boxes[i], r->levels[i].image, boxes[i + 1]);
+        }
+        memory_barrier(cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
+    // ...and back up, smoothing on the way.
+    for (int i = BLUR_LEVELS - 1; i > 0; i--) {
+        blit_box(cb, r->levels[i].image, VK_IMAGE_LAYOUT_GENERAL, boxes[i + 1], r->levels[i - 1].image, boxes[i]);
+        memory_barrier(cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
+    memory_barrier(cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    image_barrier(cb, r->scene.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+    // Carry on drawing the scene, starting with the blurred backdrop.
+    VkRenderPassBeginInfo passInfo = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                       .renderPass = r->scenePassLoad,
+                                       .framebuffer = r->sceneFramebuffer,
+                                       .renderArea = { { 0, 0 }, r->extent } };
+    vkCmdBeginRenderPass(cb, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipeline);
+    set_full_viewport(r);
+    const float lw = (float)r->levels[0].width * 2.0f, lh = (float)r->levels[0].height * 2.0f;
+    PushConstants push = { .rect = { (float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0) },
+                           .screen = { (float)W, (float)H },
+                           .mode = 0.0f,
+                           .opacity = 1.0f,
+                           .uvRect = { (float)x0 / lw, (float)y0 / lh, (float)(x1 - x0) / lw, (float)(y1 - y0) / lh } };
+    draw_quad_set(r, r->blurDescriptor, &push);
+}
+
+static void draw_quad_set(VulkanRenderer* r, VkDescriptorSet set, const PushConstants* push) {
     vkCmdBindDescriptorSets(r->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipelineLayout,
-                            0, 1, &texture->descriptor, 0, NULL);
+                            0, 1, &set, 0, NULL);
     vkCmdPushConstants(r->commandBuffer, r->pipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*push), push);
     vkCmdDraw(r->commandBuffer, 6, 1, 0, 0);
+}
+
+static void draw_quad(VulkanRenderer* r, RendererTexture* texture, const PushConstants* push) {
+    draw_quad_set(r, texture->descriptor, push);
 }
 
 void renderer_draw_texture(VulkanRenderer* r, RendererTexture* texture, int x, int y, int width, int height,
@@ -632,7 +889,8 @@ void renderer_draw_texture(VulkanRenderer* r, RendererTexture* texture, int x, i
     PushConstants push = { .rect = { (float)x, (float)y, (float)width, (float)height },
                            .screen = { (float)r->extent.width, (float)r->extent.height },
                            .mode = hasAlpha ? 1.0f : 0.0f,
-                           .opacity = opacity };
+                           .opacity = opacity,
+                           .uvRect = { 0.0f, 0.0f, 1.0f, 1.0f } };
     draw_quad(r, texture, &push);
 }
 
@@ -645,12 +903,37 @@ void renderer_draw_shadow(VulkanRenderer* r, int x, int y, int width, int height
                            .params = { (float)radius, (float)radius, (float)width, (float)height },
                            .screen = { (float)r->extent.width, (float)r->extent.height },
                            .mode = 2.0f,
-                           .opacity = strength };
+                           .opacity = strength,
+                           .uvRect = { 0.0f, 0.0f, 1.0f, 1.0f } };
     draw_quad(r, r->blank, &push);
 }
 
 void renderer_end_frame(VulkanRenderer* r) {
     vkCmdEndRenderPass(r->commandBuffer);
+    if (r->offscreen) {
+        // The finished scene, drawn onto the swapchain image.
+        VkCommandBuffer cb = r->commandBuffer;
+        image_barrier(cb, r->scene.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        VkClearValue clear = { .color = { { 0.0f, 0.0f, 0.0f, 1.0f } } };
+        VkRenderPassBeginInfo passInfo = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                           .renderPass = r->renderPass,
+                                           .framebuffer = r->framebuffers[r->imageIndex],
+                                           .renderArea = { { 0, 0 }, r->extent },
+                                           .clearValueCount = 1, .pClearValues = &clear };
+        vkCmdBeginRenderPass(cb, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pipeline);
+        set_full_viewport(r);
+        PushConstants push = { .rect = { 0.0f, 0.0f, (float)r->extent.width, (float)r->extent.height },
+                               .screen = { (float)r->extent.width, (float)r->extent.height },
+                               .mode = 0.0f, .opacity = 1.0f,
+                               .uvRect = { 0.0f, 0.0f, 1.0f, 1.0f } };
+        draw_quad_set(r, r->sceneDescriptor, &push);
+        vkCmdEndRenderPass(cb);
+        r->offscreen = 0;
+    }
     vkEndCommandBuffer(r->commandBuffer);
 
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -685,7 +968,9 @@ static int renderer_init(VulkanRenderer* r) {
                                                .dpy = r->display, .window = r->target };
     CHECK(vkCreateXlibSurfaceKHR(r->instance, &surfaceInfo, NULL, &r->surface), "cannot create a Vulkan surface");
     if (!pick_device(r) || !create_device(r) || !choose_surface_format(r)) return 0;
-    if (!create_render_pass(r) || !create_swapchain(r) || !create_pipeline(r)) return 0;
+    check_blur_support(r);
+    // The pipeline first: the swapchain's blur targets use its descriptor sets.
+    if (!create_render_pass(r) || !create_pipeline(r) || !create_swapchain(r)) return 0;
     r->blank = renderer_texture_create(r, 1, 1);
     return r->blank != NULL;
 }
@@ -715,6 +1000,9 @@ void renderer_destroy(VulkanRenderer* r) {
         if (r->pipeline) vkDestroyPipeline(r->device, r->pipeline, NULL);
         if (r->pipelineLayout) vkDestroyPipelineLayout(r->device, r->pipelineLayout, NULL);
         if (r->sampler) vkDestroySampler(r->device, r->sampler, NULL);
+        if (r->linearSampler) vkDestroySampler(r->device, r->linearSampler, NULL);
+        if (r->scenePassClear) vkDestroyRenderPass(r->device, r->scenePassClear, NULL);
+        if (r->scenePassLoad) vkDestroyRenderPass(r->device, r->scenePassLoad, NULL);
         if (r->descriptorPool) vkDestroyDescriptorPool(r->device, r->descriptorPool, NULL);
         if (r->descriptorLayout) vkDestroyDescriptorSetLayout(r->device, r->descriptorLayout, NULL);
         if (r->renderPass) vkDestroyRenderPass(r->device, r->renderPass, NULL);

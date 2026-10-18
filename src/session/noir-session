@@ -4,9 +4,9 @@
 #
 # Settings come from /etc/noir/session.conf and ~/.config/noir/session.conf
 # (plain shell, later wins):
-#   NOIR_WM_ARGS     arguments for NoirWM     (default: none; --no-compositor
+#   NOIR_WM_ARGS     arguments for NoirWM     (default: from the environment, else none; --no-compositor
 #                    turns the Vulkan compositor off)
-#   NOIR_SHELL_ARGS  arguments for NoirShell  (default: none)
+#   NOIR_SHELL_ARGS  arguments for NoirShell  (default: from the environment, else none)
 
 # The shell needs a session bus for notifications.
 if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-run-session >/dev/null 2>&1; then
@@ -17,8 +17,10 @@ export XDG_CURRENT_DESKTOP=Noir
 export XDG_SESSION_DESKTOP=noir
 export XDG_SESSION_TYPE=x11
 
-NOIR_WM_ARGS=
-NOIR_SHELL_ARGS=
+# Defaults may come from the environment (development harnesses); the
+# configuration files below still have the last word.
+NOIR_WM_ARGS=${NOIR_WM_ARGS-}
+NOIR_SHELL_ARGS=${NOIR_SHELL_ARGS-}
 for conf in /etc/noir/session.conf "${XDG_CONFIG_HOME:-$HOME/.config}/noir/session.conf"; do
     [ -r "$conf" ] && . "$conf"
 done
@@ -33,14 +35,25 @@ NoirWM $NOIR_WM_ARGS >"$log_dir/wm.log" 2>&1 &
 wm=$!
 
 # Let the window manager take the root window before the shell maps its
-# surfaces, so they are stacked and given their struts from the start.
+# surfaces, so they are stacked and given their struts from the start, and
+# so the shell finds the compositor (it picks translucent surfaces then).
+# EWMH: the WM is up when the root's _NET_SUPPORTING_WM_CHECK names a window
+# that names itself; the root property alone may be left from a previous WM.
+wm_ready() {
+    check=$(xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | sed -n 's/.*window id # *//p')
+    [ -n "$check" ] && xprop -id "$check" _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q "$check"
+}
 if command -v xprop >/dev/null 2>&1; then
     tries=0
-    while [ $tries -lt 50 ] && kill -0 $wm 2>/dev/null \
-          && ! xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; do
+    while [ $tries -lt 50 ] && kill -0 $wm 2>/dev/null && ! wm_ready; do
         sleep 0.1
         tries=$((tries + 1))
     done
+fi
+
+# Put the saved display, input and screen settings back (Control Center).
+if command -v NoirControlCenter >/dev/null 2>&1; then
+    NoirControlCenter --apply >>"$log_dir/control-center.log" 2>&1
 fi
 
 # The session lasts as long as the shell does.

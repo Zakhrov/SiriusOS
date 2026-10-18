@@ -1,5 +1,5 @@
 import QtQuick
-import Noir.Shell
+import Noir.Ui
 
 // Base interactive element. Inverts colours on hover/keyboard focus and sinks
 // with a 3D press (scale + bevel flip) when activated by mouse or keyboard.
@@ -31,6 +31,9 @@ FocusScope {
     implicitWidth: row.implicitWidth + horizontalPadding * 2
     implicitHeight: Math.max(iconSize, label.implicitHeight) + 16
     activeFocusOnTab: true
+    // Disabled buttons fade back; they still show their state.
+    opacity: enabled ? 1 : 0.35
+    Behavior on opacity { NumberAnimation { duration: Theme.durationFast } }
 
     Accessible.role: Accessible.Button
     Accessible.name: text.length ? text : toolTip

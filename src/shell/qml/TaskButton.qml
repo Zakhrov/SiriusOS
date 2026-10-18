@@ -1,5 +1,6 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 // One running window in the taskbar. Active window = inverted (white) tile;
 // minimized windows are dimmed; urgent windows pulse their underline.
@@ -36,7 +37,7 @@ NoirButton {
             anchors.verticalCenter: parent.verticalCenter
             visible: !appIcon.visible
             size: 20
-            source: "icons/noir-app.svg"
+            source: Theme.icon("app")
             color: task.foreground
         }
         Text {

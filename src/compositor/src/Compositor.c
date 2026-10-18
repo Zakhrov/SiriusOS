@@ -20,6 +20,7 @@
 #define SHADOW_OFFSET_Y 6
 #define SHADOW_STRENGTH 0.55f
 #define FRAME_INTERVAL_MS 16
+#define MAX_BLUR_RECTS 16
 
 // One top-level window (a direct child of the root).
 typedef struct {
@@ -35,6 +36,10 @@ typedef struct {
     int stale;                  // whole texture must be refetched
     int dirty;                  // dirty rectangle below is valid
     int dirtyX0, dirtyY0, dirtyX1, dirtyY1;
+    // Blur behind (KDE's _KDE_NET_WM_BLUR_BEHIND_REGION): rectangles relative
+    // to the window's outer top-left corner.
+    int blurCount;
+    int blurRects[MAX_BLUR_RECTS][4];
 } CompWindow;
 
 struct NoirCompositor {
@@ -51,6 +56,7 @@ struct NoirCompositor {
     int count, capacity;
     int needsFrame;
     long long lastFrameMs;
+    Atom blurAtom;
 };
 
 static long long now_ms(void) {
@@ -86,6 +92,73 @@ static void release_contents(NoirCompositor* c, CompWindow* w) {
     w->dirty = 0;
 }
 
+// Adds PropertyChangeMask to the events this connection selects on `id`
+// without dropping what the window manager selected on it already.
+static void watch_properties(NoirCompositor* c, Window id) {
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(c->display, id, &wa) && !(wa.your_event_mask & PropertyChangeMask)) {
+        XSelectInput(c->display, id, wa.your_event_mask | PropertyChangeMask);
+    }
+}
+
+// Reads the blur region of `id`, placed at (dx, dy) inside the top-level
+// window `w` and `width` x `height` big. Returns 0 when it has none.
+static int read_blur_region(NoirCompositor* c, CompWindow* w, Window id, int dx, int dy, int width, int height) {
+    Atom type = None;
+    int format = 0;
+    unsigned long count = 0, after = 0;
+    unsigned char* data = NULL;
+    if (XGetWindowProperty(c->display, id, c->blurAtom, 0, 4 * MAX_BLUR_RECTS, False, XA_CARDINAL,
+                           &type, &format, &count, &after, &data) != Success || type == None) {
+        if (data) XFree(data);
+        return 0;
+    }
+    const long* values = (const long*)data;   // 32-bit properties come back as longs
+    w->blurCount = 0;
+    if (count < 4) {
+        // Empty: the whole window.
+        w->blurRects[0][0] = dx; w->blurRects[0][1] = dy;
+        w->blurRects[0][2] = width; w->blurRects[0][3] = height;
+        w->blurCount = 1;
+    }
+    for (unsigned long i = 0; i + 3 < count && w->blurCount < MAX_BLUR_RECTS; i += 4) {
+        int* rect = w->blurRects[w->blurCount++];
+        rect[0] = dx + (int)values[i]; rect[1] = dy + (int)values[i + 1];
+        rect[2] = (int)values[i + 2]; rect[3] = (int)values[i + 3];
+    }
+    if (data) XFree(data);
+    return 1;
+}
+
+// A top-level window carries the region itself, or (inside a NoirWM frame)
+// its client window does.
+static void read_blur(NoirCompositor* c, CompWindow* w) {
+    w->blurCount = 0;
+    watch_properties(c, w->id);
+    if (read_blur_region(c, w, w->id, 0, 0, w->width + 2 * w->border, w->height + 2 * w->border)) {
+        c->needsFrame = 1;
+        return;
+    }
+    Window rootReturn, parentReturn, *children = NULL;
+    unsigned int childCount = 0;
+    if (!XQueryTree(c->display, w->id, &rootReturn, &parentReturn, &children, &childCount)) {
+        return;
+    }
+    for (unsigned int i = 0; i < childCount; i++) {
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(c->display, children[i], &wa) || wa.class == InputOnly) {
+            continue;
+        }
+        watch_properties(c, children[i]);
+        if (read_blur_region(c, w, children[i], w->border + wa.x + wa.border_width, w->border + wa.y + wa.border_width,
+                             wa.width, wa.height)) {
+            c->needsFrame = 1;
+            break;
+        }
+    }
+    if (children) XFree(children);
+}
+
 // Track `id` (a child of the root) at the top of the stack.
 static CompWindow* add_window(NoirCompositor* c, Window id) {
     int index = find_index(c, id);
@@ -111,6 +184,7 @@ static CompWindow* add_window(NoirCompositor* c, Window id) {
     w->viewable = wa.map_state == IsViewable;
     w->stale = 1;
     w->damage = XDamageCreate(c->display, id, XDamageReportNonEmpty);
+    read_blur(c, w);
     c->needsFrame = 1;
     return w;
 }
@@ -306,9 +380,11 @@ void compositor_handle_event(NoirCompositor* c, XEvent* event) {
     case MapNotify: {
         int index = event->xmap.event == c->root ? find_index(c, event->xmap.window) : -1;
         if (index >= 0) {
-            // Mapping gives the window a new off-screen pixmap.
+            // Mapping gives the window a new off-screen pixmap, and a framed
+            // client is in its frame by now.
             release_contents(c, &c->windows[index]);
             c->windows[index].viewable = 1;
+            read_blur(c, &c->windows[index]);
             c->needsFrame = 1;
         }
         break;
@@ -324,6 +400,14 @@ void compositor_handle_event(NoirCompositor* c, XEvent* event) {
     }
     case ConfigureNotify: {
         XConfigureEvent* e = &event->xconfigure;
+        if (e->window == c->root) {
+            // The screen changed size; the overlay follows it, the swapchain
+            // has to be rebuilt (software presentation never reports it out
+            // of date).
+            renderer_resize(c->renderer);
+            c->needsFrame = 1;
+            break;
+        }
         int index = e->event == c->root ? find_index(c, e->window) : -1;
         if (index < 0) {
             break;
@@ -334,6 +418,7 @@ void compositor_handle_event(NoirCompositor* c, XEvent* event) {
             release_contents(c, w);
             w->width = e->width; w->height = e->height;
             w->border = e->border_width;
+            read_blur(c, w);
             c->needsFrame = 1;
         }
         if (w->x != e->x || w->y != e->y) {
@@ -343,6 +428,23 @@ void compositor_handle_event(NoirCompositor* c, XEvent* event) {
         restack(c, e->window, e->above);
         break;
     }
+    case PropertyNotify:
+        if (event->xproperty.atom == c->blurAtom) {
+            // On a top-level window, or on a client inside a frame.
+            int index = find_index(c, event->xproperty.window);
+            if (index < 0) {
+                Window rootReturn, parent = None, *children = NULL;
+                unsigned int childCount = 0;
+                if (XQueryTree(c->display, event->xproperty.window, &rootReturn, &parent, &children, &childCount)) {
+                    if (children) XFree(children);
+                    index = find_index(c, parent);
+                }
+            }
+            if (index >= 0) {
+                read_blur(c, &c->windows[index]);
+            }
+        }
+        break;
     case CirculateNotify:
         if (event->xcirculate.event == c->root && c->count > 0) {
             restack(c, event->xcirculate.window,
@@ -383,7 +485,13 @@ void compositor_draw(NoirCompositor* c) {
             refresh_window(c, w);
         }
     }
-    if (!renderer_begin_frame(c->renderer)) {
+    // Only frames with a translucent window asking for blur pay for it.
+    int wantBlur = 0;
+    for (int i = 0; i < c->count && !wantBlur; i++) {
+        const CompWindow* w = &c->windows[i];
+        wantBlur = w->viewable && w->texture && w->depth == 32 && w->blurCount > 0;
+    }
+    if (!renderer_begin_frame(c->renderer, wantBlur)) {
         c->needsFrame = 1;
         return;
     }
@@ -395,6 +503,12 @@ void compositor_draw(NoirCompositor* c) {
         if (w->shadow) {
             renderer_draw_shadow(c->renderer, w->x, w->y + SHADOW_OFFSET_Y, outer_width(w), outer_height(w),
                                  SHADOW_RADIUS, SHADOW_STRENGTH);
+        }
+        if (w->depth == 32) {
+            for (int b = 0; b < w->blurCount; b++) {
+                const int* rect = w->blurRects[b];
+                renderer_draw_blur(c->renderer, w->x + rect[0], w->y + rect[1], rect[2], rect[3]);
+            }
         }
         renderer_draw_texture(c->renderer, w->texture, w->x, w->y, outer_width(w), outer_height(w),
                               w->depth == 32, 1.0f);
@@ -430,6 +544,7 @@ NoirCompositor* compositor_create(Display* display, Window root) {
     c->root = root;
     c->damageEvent = damageEvent;
     c->hasShm = XShmQueryExtension(display);
+    c->blurAtom = XInternAtom(display, "_KDE_NET_WM_BLUR_BEHIND_REGION", False);
 
     // The overlay sits above every window and below the pointer. It must not
     // take input, so clicks fall through to the real windows underneath.

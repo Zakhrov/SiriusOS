@@ -1,5 +1,6 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 FloatingWidget {
     id: clock
@@ -24,7 +25,7 @@ FloatingWidget {
         Row {
             spacing: 6
             Text {
-                text: Qt.formatTime(clock.now, "hh:mm")
+                text: Qt.formatTime(clock.now, NoirConfig.timeFormat(false))
                 color: Theme.white
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontHuge
@@ -33,6 +34,7 @@ FloatingWidget {
             }
             Text {
                 anchors.baseline: parent.children[0].baseline
+                visible: NoirConfig.clockShowSeconds
                 text: Qt.formatTime(clock.now, "ss")
                 color: Theme.silverDim
                 font.family: Theme.monoFamily

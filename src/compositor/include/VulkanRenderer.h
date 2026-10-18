@@ -12,6 +12,8 @@ typedef struct RendererTexture RendererTexture;
 VulkanRenderer* renderer_create(Display* display, Window target);
 void renderer_destroy(VulkanRenderer* renderer);
 const char* renderer_device_name(const VulkanRenderer* renderer);
+// Rebuild the swapchain for the target's current size.
+void renderer_resize(VulkanRenderer* renderer);
 
 RendererTexture* renderer_texture_create(VulkanRenderer* renderer, int width, int height);
 void renderer_texture_destroy(VulkanRenderer* renderer, RendererTexture* texture);
@@ -23,7 +25,14 @@ void renderer_texture_update(VulkanRenderer* renderer, RendererTexture* texture,
 
 // A frame is begin, any number of draws (painted in call order), end.
 // begin returns 0 when no image could be acquired; skip the frame then.
-int renderer_begin_frame(VulkanRenderer* renderer);
+// `offscreen` asks for a frame that can blur (see renderer_draw_blur).
+int renderer_begin_frame(VulkanRenderer* renderer, int offscreen);
+// Whether blur behind windows is available on this device.
+int renderer_blur_supported(const VulkanRenderer* renderer);
+// Frosted glass: blurs what has been drawn so far inside the rectangle and
+// paints it back there, for a translucent window drawn next to sit on. Only
+// in offscreen frames.
+void renderer_draw_blur(VulkanRenderer* renderer, int x, int y, int width, int height);
 void renderer_draw_texture(VulkanRenderer* renderer, RendererTexture* texture,
                            int x, int y, int width, int height, int hasAlpha, float opacity);
 // Soft shadow around the rectangle (x, y, width, height), `radius` pixels wide.

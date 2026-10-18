@@ -1,4 +1,4 @@
-project(NoirVulkanCompositor LANGUAGES C)
+project(NoirVulkanCompositor VERSION ${NOIR_VERSION} LANGUAGES C)
 set(CMAKE_C_STANDARD 17)
 
 # Shaders are compiled to SPIR-V at build time and embedded as C arrays.
@@ -20,11 +20,13 @@ endforeach()
 
 add_library(NoirVulkanCompositor SHARED
     src/VulkanRenderer.c src/Compositor.c ${SHADER_HEADERS})
+set_target_properties(NoirVulkanCompositor PROPERTIES
+    VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_include_directories(NoirVulkanCompositor
     PUBLIC include
     PRIVATE ${X11_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(NoirVulkanCompositor
-    ${X11_LIBRARIES} ${X11_Xext_LIB} ${X11_Xcomposite_LIB} ${X11_Xdamage_LIB} ${X11_Xfixes_LIB}
-    Vulkan::Vulkan)
+    ${X11_LIBRARIES} ${X11_X11_xcb_LIB} ${X11_Xext_LIB} ${X11_Xcomposite_LIB} ${X11_Xdamage_LIB} ${X11_Xfixes_LIB}
+    Vulkan::Vulkan NoirVulkanDevice)
 
 install(TARGETS NoirVulkanCompositor LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

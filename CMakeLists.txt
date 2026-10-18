@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
-project(SiriusOS_NDE LANGUAGES C CXX)
+set(NOIR_VERSION 0.0.1)
+project(SiriusOS_NDE VERSION ${NOIR_VERSION} LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)

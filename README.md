@@ -12,5 +12,7 @@ SiriusOS is a modern, sleek, and cyberpunk-inspired operating system designed to
 
 - **Noir Desktop Environment Window Manager**: A from-scratch X11 window manager with a Vulkan based compositor
 - **Noir Shell**: The Qt 6 / QML desktop shell (desktop, widgets, taskbar, start menu, system tray and notifications), rendered with Vulkan. See [src/shell/README.md](src/shell/README.md)
+- **Noir Control Center**: System settings in the style of KDE's System Settings: appearance, notifications, default applications, displays, sound, input devices, power, graphics, network, Bluetooth, date and time, and system information. See [src/control_center/README.md](src/control_center/README.md)
 - **Xvfb harness**: Runs the window manager and shell headlessly for inspection, debugging and smoke tests. See [tools/xvfb/README.md](tools/xvfb/README.md)
-- **Session and VM**: `noir-session` starts the desktop from a display manager, and a QEMU harness boots it on openSUSE Leap 15.6. See [tools/vm/README.md](tools/vm/README.md)
+- **Try it yourself**: `tools/desktop/noir-desktop start` opens the whole desktop in a window with your real GPU (direct DRI3 presentation, the compositor's translucent glass), and `install-session` adds the development build to the login screen for bare metal. See [tools/desktop/README.md](tools/desktop/README.md)
+- **Session and VM**: `noir-session` starts the desktop from a display manager, and a QEMU harness, the current target, boots it on openSUSE Leap 15.6 (Vulkan through virtio-gpu Venus when QEMU supports it, lavapipe otherwise). See [tools/vm/README.md](tools/vm/README.md)

@@ -12,6 +12,7 @@ STATE=${NOIR_XVFB_STATE:-$BUILD/xvfb}
 SHELL_BIN=$BUILD/src/shell/NoirShell
 WM_BIN=$BUILD/src/window_manager/NoirWM
 XINJECT_BIN=$BUILD/tools/xvfb/noir-xinject
+VULKAN=${NOIR_XVFB_VULKAN:-gpu}
 
 DEBUG_SERVICE=org.siriusos.NoirShell
 DEBUG_IFACE=org.siriusos.NoirShell.Debug
@@ -24,12 +25,11 @@ Session
   start [options]         boot Xvfb, D-Bus, NoirWM and NoirShell
       --size WxH            screen size (default 1280x720)
       --display :N          use a fixed display number (default: first free)
-      --backend NAME        shell renderer: auto, opengl, software, vulkan
       --demo                sample tasks and notifications (NoirShell --demo)
       --windowed [WxH]      single-window development shell instead of the session
       --no-wm               do not start a window manager
-      --compositor          let NoirWM composite (needs a software Vulkan driver such as
-                            lavapipe; point VK_DRIVER_FILES at its ICD if it is not installed)
+      --vulkan gpu|cpu      render on the host GPU or on lavapipe (default: $VULKAN)
+      --compositor          let NoirWM composite
       --wm "CMD"            window manager command (default: NoirWM --no-compositor)
       --wrap "CMD"          prefix for the shell command, e.g. "gdb -batch -ex run -ex bt --args"
   stop                    tear everything down
@@ -111,9 +111,20 @@ session_env() {
           QT_IM_MODULE GTK_IM_MODULE XMODIFIERS QSG_RHI_BACKEND
     export DISPLAY=":$(<"$STATE/display")"
     export DBUS_SESSION_BUS_ADDRESS="$(<"$STATE/bus.addr")"
+    # Xvfb has no DRI3, so GPU drivers can only present through Mesa's
+    # software path: render on the GPU, copy each frame over X requests.
+    if [[ $(cat "$STATE/vulkan" 2>/dev/null) == gpu ]]; then
+        export MESA_VK_WSI_DEBUG=sw
+    else
+        unset MESA_VK_WSI_DEBUG
+    fi
     export XDG_CURRENT_DESKTOP=Noir XDG_SESSION_TYPE=x11 QT_QPA_PLATFORM=xcb
-    # Xvfb has no GPU: have Mesa go straight to llvmpipe.
-    export LIBGL_ALWAYS_SOFTWARE=1
+    # Settings written in the session (Control Center, mimeapps.list,
+    # session.conf) stay in the harness, away from the host user's own.
+    export XDG_CONFIG_HOME="$STATE/config"
+    mkdir -p "$XDG_CONFIG_HOME"
+    # The shell starts the Control Center by name.
+    export PATH="$BUILD/src/control_center:$BUILD/src/shell:$BUILD/src/window_manager:$PATH"
     # Without a terminal Qt would send its messages to the journal, not the log.
     export QT_FORCE_STDERR_LOGGING=1
 }
@@ -147,13 +158,27 @@ start_shell() {
 # Succeeds once the debug interface answers; gives up early if the shell died.
 shell_up() { alive shell || return 0; debug_ready; }
 
+# The Noir stack renders with Vulkan only: on a GPU when the host has a render
+# node, otherwise on a CPU driver such as lavapipe, whose ICD manifest is
+# named lvp_icd.*.json.
+have_gpu() { compgen -G "/dev/dri/renderD*" >/dev/null; }
+
+have_software_vulkan() {
+    local dir manifests=${VK_DRIVER_FILES:-${VK_ICD_FILENAMES:-}}
+    [[ -n $manifests ]] && return 0
+    for dir in /etc/vulkan/icd.d /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d; do
+        compgen -G "$dir/lvp_icd.*.json" >/dev/null && return 0
+    done
+    return 1
+}
+
 cmd_start() {
-    local size=1280x720 display="" backend="" demo=0 windowed="" wm=1 wm_cmd="" wrap="" compositor=0
+    local size=1280x720 display="" vulkan=$VULKAN demo=0 windowed="" wm=1 wm_cmd="" wrap="" compositor=0
     while (($#)); do
         case $1 in
             --size) size=$2; shift 2 ;;
             --display) display=${2#:}; shift 2 ;;
-            --backend) backend=$2; shift 2 ;;
+            --vulkan) vulkan=$2; shift 2 ;;
             --demo) demo=1; shift ;;
             --windowed)
                 if [[ ${2:-} =~ ^[0-9]+x[0-9]+$ ]]; then windowed=$2; shift 2; else windowed=auto; shift; fi ;;
@@ -169,6 +194,13 @@ cmd_start() {
 
     alive xvfb && die "a session is already running on :$(<"$STATE/display") (noir-xvfb stop)"
     need Xvfb; need dbus-daemon; need dbus-send; need xprop
+    case $vulkan in
+        gpu) have_gpu || { echo "noir-xvfb: no GPU render node; rendering on the CPU" >&2; vulkan=cpu; } ;;
+        cpu) ;;
+        *) die "start: --vulkan expects gpu or cpu" ;;
+    esac
+    [[ $vulkan == gpu ]] || have_software_vulkan || die "no software Vulkan driver found: install lavapipe
+(libvulkan_lvp on openSUSE) or point VK_DRIVER_FILES at its ICD manifest"
     [[ -x $SHELL_BIN ]] || die "$SHELL_BIN not found; build first: cmake -B $BUILD -S $REPO && cmake --build $BUILD"
     if ((wm)) && [[ -z $wm_cmd ]]; then
         [[ -x $WM_BIN ]] || die "$WM_BIN not found; build it or pass --no-wm / --wm"
@@ -178,6 +210,7 @@ cmd_start() {
 
     mkdir -p "$STATE/shots"
     rm -f "$STATE"/*.pid "$STATE"/*.log "$STATE/display" "$STATE/bus.addr"
+    echo "$vulkan" >"$STATE/vulkan"
 
     # X server. -displayfd doubles as the readiness signal.
     if [[ -n $display ]]; then
@@ -222,7 +255,6 @@ EOF
     cmd+=("$SHELL_BIN" --debug-interface)
     ((demo)) && cmd+=(--demo)
     [[ -n $windowed ]] && cmd+=(--windowed "$windowed")
-    [[ -n $backend ]] && cmd+=(--backend "$backend")
     declare -p cmd >"$STATE/shell.cmd"
     start_shell || { cmd_stop; exit 1; }
     alive shell || { echo "noir-xvfb: the shell exited during startup:" >&2; tail -n 25 "$STATE/shell.log" >&2; cmd_stop; exit 1; }
@@ -231,7 +263,13 @@ EOF
     echo "Try: noir-xvfb status | shot | tree | logs"
 }
 
-wm_ready() { xprop -root _NET_SUPPORTING_WM_CHECK | grep -q 'window id'; }
+# EWMH: the root's check window must exist and name itself (the root
+# property alone may be left over from a window manager that is gone).
+wm_ready() {
+    local check
+    check=$(xprop -root _NET_SUPPORTING_WM_CHECK | sed -n 's/.*window id # *//p')
+    [[ -n $check ]] && [[ $(xprop -id "$check" _NET_SUPPORTING_WM_CHECK 2>/dev/null) == *"$check"* ]]
+}
 
 cmd_stop() {
     local name
@@ -258,6 +296,9 @@ cmd_status() {
     session_env
     echo "display  $DISPLAY  $(xprop -root _NET_DESKTOP_GEOMETRY 2>/dev/null | sed 's/.*= //; s/, /x/')"
     echo "bus      $DBUS_SESSION_BUS_ADDRESS"
+    echo "vulkan   $(<"$STATE/vulkan")"
+    sed -n 's/^NoirShell: rendering with /shell    /p; s/^NoirWM: compositing with /wm       /p' \
+        "$STATE/shell.log" "$STATE/wm.log" 2>/dev/null | head -n 2
     local name
     for name in xvfb dbus wm shell vnc; do
         [[ -e $STATE/$name.pid ]] || continue
@@ -380,6 +421,7 @@ client_id() { wmctrl -l -x | awk -v name="$1" '$3 ~ "^" name "\\." { print $1; f
 cmd_smoke() {
     [[ -n ${NOIR_XVFB_STATE:-} ]] || STATE=$BUILD/xvfb-smoke
     alive xvfb && cmd_stop
+    rm -rf "$STATE/config"     # start from default settings
     trap cmd_stop EXIT
     cmd_start --demo "$@" >/dev/null
     session_env
@@ -430,6 +472,27 @@ cmd_smoke() {
         echo "  skip  window decorations (needs xclock and wmctrl)"
     fi
 
+    # Control Center: opens, keeps to one window, and settings reach the shell.
+    if [[ -x $BUILD/src/control_center/NoirControlCenter ]] && command -v wmctrl >/dev/null 2>&1; then
+        setsid NoirControlCenter --page about >>"$STATE/clients.log" 2>&1 </dev/null &
+        disown
+        check "the Control Center opens on the requested page" wait_for 8 "Control Center" eval \
+            'wmctrl -l | grep -q "About This System — Control Center"'
+        NoirControlCenter --page display >>"$STATE/clients.log" 2>&1 </dev/null
+        check "starting it again switches the open window's page" wait_for 5 "page switch" eval \
+            'wmctrl -l | grep -q "Display — Control Center"'
+        check "only one Control Center runs" eval '(( $(pgrep -fc "^NoirControlCenter") == 1 ))'
+        cmd_shot "$STATE/shots/smoke-control-center.png" >/dev/null
+        mkdir -p "$XDG_CONFIG_HOME/SiriusOS"
+        printf '[Desktop]\nShowWidgets=false\n' >"$XDG_CONFIG_HOME/SiriusOS/Noir.ini"
+        check "a changed setting reaches the running shell" wait_for 5 "setting" eval_is \
+            "NoirConfig.showDesktopWidgets" false
+        pkill -f '^NoirControlCenter' || true
+        wait_for 5 "the Control Center to close" eval '! wmctrl -l | grep -q "Control Center"' || true
+    else
+        echo "  skip  Control Center (not built, or wmctrl missing)"
+    fi
+
     echo "  shot  $(cmd_shot "$STATE/shots/smoke.png")"
     if ((smoke_failures)); then
         echo "smoke test: $smoke_failures check(s) failed; logs in $STATE"
@@ -458,7 +521,9 @@ case $command in
         session_env
         echo "export DISPLAY=$DISPLAY"
         echo "export DBUS_SESSION_BUS_ADDRESS='$DBUS_SESSION_BUS_ADDRESS'"
-        echo "export LIBGL_ALWAYS_SOFTWARE=1 QT_QPA_PLATFORM=xcb QT_FORCE_STDERR_LOGGING=1" ;;
+        echo "export QT_QPA_PLATFORM=xcb QT_FORCE_STDERR_LOGGING=1"
+        [[ -n ${MESA_VK_WSI_DEBUG:-} ]] && echo "export MESA_VK_WSI_DEBUG=$MESA_VK_WSI_DEBUG"
+        true ;;
     click) cmd_click "$@" ;;
     move | drag | scroll | key | type) session_env; xinject "$command" "$@" ;;
     notify) cmd_notify "$@" ;;

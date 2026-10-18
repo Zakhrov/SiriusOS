@@ -88,9 +88,31 @@ same X connection:
 - NoirWM owns `_NET_WM_CM_S0`, which is how clients (NoirShell included)
   learn that translucent windows will be blended.
 
-Any Vulkan driver that can present to the X server works, including Mesa's
-software driver (lavapipe). `NOIR_VK_DEVICE=<index>` picks a device and
-`NOIR_VK_VALIDATION=1` enables the validation layer.
+Any Vulkan driver (1.0 or later) that can present to the X server works, including
+Mesa's software driver (lavapipe). The device is chosen by the code NoirShell
+uses too ([`src/vulkan_device`](../vulkan_device/include/NoirVulkanDevice.h)),
+so both land on the same GPU: the one `NOIR_VK_DEVICE` names (part of its
+name, or an index), else the one driving the X server, else the best device
+type. `NOIR_VK_VALIDATION=1` enables the validation layer.
+
+### Blur behind (frosted glass)
+
+The compositor implements KDE's `_KDE_NET_WM_BLUR_BEHIND_REGION`: a
+translucent window that sets it (a list of x, y, width, height rectangles in
+its own coordinates; empty for the whole window) gets what lies behind those
+rectangles blurred before it is drawn. NoirShell uses it for the taskbar,
+start menu and notifications, and KDE/Qt applications such as Konsole set it
+themselves. The property may sit on the top-level window or, for framed
+clients, on the client inside the frame.
+
+Frames that contain such a window are drawn into an offscreen image instead
+of the swapchain. For each blurred rectangle (plus a 64-pixel margin, so the
+edges blur naturally) the scene so far is copied down a pyramid of half-size
+images and back up with linear-filtered blits — a smooth blur that needs no
+extra shaders — drawn back under the window, and the finished scene is then
+drawn to the swapchain. Frames without blur skip all of it. It needs the
+output format to support linear blits (any GPU, and lavapipe);
+`NOIR_NO_BLUR=1` turns it off.
 
 Window contents travel through the CPU, which is simple and driver
 independent but not free; a zero-copy path (DRI3 pixmaps imported as

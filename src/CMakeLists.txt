@@ -1,4 +1,7 @@
+add_subdirectory(vulkan_device)
 add_subdirectory(window_manager)
 add_subdirectory(compositor)
+add_subdirectory(ui)
 add_subdirectory(shell)
+add_subdirectory(control_center)
 add_subdirectory(session)

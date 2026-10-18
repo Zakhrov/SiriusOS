@@ -1,5 +1,7 @@
 #include "NotificationServer.h"
 
+#include "NoirConfig.h"
+
 #include <QCoreApplication>
 #include <QDBusConnection>
 #include <QDBusError>
@@ -7,7 +9,6 @@
 
 namespace {
 NotificationServer *s_instance = nullptr;
-constexpr int DefaultTimeoutMs = 6000;
 }
 
 NotificationServer::NotificationServer(QObject *parent)
@@ -124,7 +125,7 @@ uint NotificationServer::notify(const QString &appName, uint replacesId, const Q
 
     // Critical notifications (urgency 2) and timeout 0 stay until dismissed.
     if (timeout < 0)
-        timeout = DefaultTimeoutMs;
+        timeout = qMax(1, NoirConfig::instance()->notificationTimeout()) * 1000;
     if (timeout > 0 && n.urgency < 2)
         n.timer->start(timeout);
     else
@@ -203,7 +204,7 @@ void NotificationAdaptor::CloseNotification(uint id)
 QString NotificationAdaptor::GetServerInformation(QString &vendor, QString &version, QString &spec_version)
 {
     vendor = QStringLiteral("SiriusOS");
-    version = QStringLiteral("0.1");
+    version = QStringLiteral(NOIR_VERSION);
     spec_version = QStringLiteral("1.2");
     return QStringLiteral("Noir Shell");
 }

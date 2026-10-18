@@ -1,12 +1,12 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 // Status indicators + notification counter + clock, bottom-right of the taskbar.
 Row {
     id: tray
 
     property date now: new Date()
-    signal clockClicked()
     signal notificationsClicked()
 
     spacing: 2
@@ -23,19 +23,21 @@ Row {
         anchors.verticalCenter: parent.verticalCenter
         flat: true
         width: 36; height: 36
-        iconSource: "icons/noir-network.svg"
+        iconSource: Theme.icon("network")
         iconSize: 18
         opacity: SystemMonitor.networkOnline ? 1 : 0.45
         toolTip: SystemMonitor.networkOnline ? "Connected · " + SystemMonitor.networkInterface : "Offline"
+        onClicked: Launcher.openControlCenter("network")
     }
 
     NoirButton {
         anchors.verticalCenter: parent.verticalCenter
         flat: true
         width: 36; height: 36
-        iconSource: "icons/noir-volume.svg"
+        iconSource: Theme.icon("volume")
         iconSize: 18
-        toolTip: "Volume"
+        toolTip: "Sound"
+        onClicked: Launcher.openControlCenter("sound")
     }
 
     NoirButton {
@@ -43,9 +45,10 @@ Row {
         visible: SystemMonitor.batteryPresent
         flat: true
         width: 36; height: 36
-        iconSource: "icons/noir-battery.svg"
+        iconSource: Theme.icon("battery")
         iconSize: 18
         toolTip: "Battery " + SystemMonitor.batteryPercent + "%" + (SystemMonitor.charging ? " · charging" : "")
+        onClicked: Launcher.openControlCenter("power")
     }
 
     NoirButton {
@@ -53,9 +56,11 @@ Row {
         anchors.verticalCenter: parent.verticalCenter
         flat: true
         width: 36; height: 36
-        iconSource: "icons/noir-bell.svg"
+        iconSource: Theme.icon("bell")
         iconSize: 18
-        toolTip: NotificationServer.count ? "Clear " + NotificationServer.count + " notification" + (NotificationServer.count === 1 ? "" : "s") : "No notifications"
+        opacity: NoirConfig.doNotDisturb ? 0.45 : 1
+        toolTip: NoirConfig.doNotDisturb ? "Do not disturb" + (NotificationServer.count ? " · clear " + NotificationServer.count : "")
+               : NotificationServer.count ? "Clear " + NotificationServer.count + " notification" + (NotificationServer.count === 1 ? "" : "s") : "No notifications"
         onClicked: tray.notificationsClicked()
 
         Rectangle {
@@ -81,14 +86,14 @@ Row {
         flat: true
         width: 92; height: Theme.taskbarHeight - 10
         toolTip: Qt.formatDate(tray.now, "dddd, d MMMM yyyy")
-        onClicked: tray.clockClicked()
-        Accessible.name: Qt.formatDateTime(tray.now, "hh:mm, dddd d MMMM")
+        onClicked: Launcher.openControlCenter("datetime")
+        Accessible.name: Qt.formatTime(tray.now, NoirConfig.timeFormat(false)) + ", " + Qt.formatDate(tray.now, "dddd d MMMM")
 
         Column {
             anchors.centerIn: parent
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: Qt.formatTime(tray.now, "hh:mm")
+                text: Qt.formatTime(tray.now, NoirConfig.timeFormat(false))
                 color: clockButton.foreground
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontNormal + 1
@@ -96,6 +101,7 @@ Row {
             }
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
+                visible: NoirConfig.clockShowDate
                 text: Qt.formatDate(tray.now, "dd.MM.yyyy")
                 color: clockButton.inverted ? Theme.black : Theme.silverDim
                 font.family: Theme.fontFamily

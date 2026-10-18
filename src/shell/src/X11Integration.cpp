@@ -2,6 +2,8 @@
 
 #include <QGuiApplication>
 #include <QHash>
+#include <QRectF>
+#include <QVariant>
 #include <QScreen>
 
 namespace {
@@ -116,5 +118,37 @@ void X11Integration::setupPopup(QWindow *window, bool notification)
     setAtomListProperty(id, "_NET_WM_STATE",
                         { "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_SKIP_TASKBAR",
                           "_NET_WM_STATE_SKIP_PAGER" });
+    xcb_flush(m_connection);
+}
+
+void X11Integration::setBlurBehind(QWindow *window, bool enabled, const QVariantList &rects)
+{
+    if (!m_connection || !window)
+        return;
+    const xcb_window_t id = window->winId();
+    const xcb_atom_t property = atom("_KDE_NET_WM_BLUR_BEHIND_REGION");
+    if (!enabled) {
+        xcb_delete_property(m_connection, id, property);
+        xcb_flush(m_connection);
+        return;
+    }
+    // Device pixels: the X window's own coordinates.
+    const qreal scale = window->devicePixelRatio();
+    QList<uint32_t> values;
+    for (const QVariant &value : rects) {
+        const QRectF rect = value.toRectF();
+        if (rect.isEmpty())
+            continue;
+        values << uint32_t(qRound(rect.x() * scale)) << uint32_t(qRound(rect.y() * scale))
+               << uint32_t(qRound(rect.width() * scale)) << uint32_t(qRound(rect.height() * scale));
+    }
+    // An empty list means the whole window, but only when no rectangles were
+    // asked for at all; a list whose rectangles are all empty means nothing.
+    if (values.isEmpty() && !rects.isEmpty()) {
+        xcb_delete_property(m_connection, id, property);
+    } else {
+        xcb_change_property(m_connection, XCB_PROP_MODE_REPLACE, id, property, XCB_ATOM_CARDINAL, 32,
+                            uint32_t(values.size()), values.constData());
+    }
     xcb_flush(m_connection);
 }

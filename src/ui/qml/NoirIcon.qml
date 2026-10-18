@@ -1,6 +1,6 @@
 import QtQuick
 import Qt5Compat.GraphicalEffects
-import Noir.Shell
+import Noir.Ui
 
 // First-party monochrome SVG icon, tinted to the current foreground colour so
 // it inverts together with its button (silver on black, black on white).

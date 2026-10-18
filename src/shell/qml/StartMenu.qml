@@ -1,5 +1,6 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 // Application launcher. Folds up out of the taskbar (hinged on its bottom
 // edge), type-to-search, arrow keys to move, Enter to launch, Esc to close.
@@ -90,11 +91,27 @@ FocusScope {
                 anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 10 }
                 width: 40; height: 40
                 flat: true
-                iconSource: "icons/noir-power.svg"
+                iconSource: Theme.icon("power")
                 iconSize: 20
                 toolTip: "Power"
                 onClicked: powerMenu.popup(rail.width + 4, menu.height - powerMenu.height - 10)
+                KeyNavigation.up: controlCenterButton
+            }
+
+            NoirButton {
+                id: controlCenterButton
+                anchors { horizontalCenter: parent.horizontalCenter; bottom: powerButton.top; bottomMargin: 6 }
+                width: 40; height: 40
+                flat: true
+                iconSource: Theme.icon("settings")
+                iconSize: 20
+                toolTip: "Control Center"
+                onClicked: {
+                    Launcher.openControlCenter("")
+                    menu.closeRequested()
+                }
                 KeyNavigation.up: search
+                KeyNavigation.down: powerButton
             }
         }
 
@@ -116,7 +133,7 @@ FocusScope {
                 id: searchIcon
                 anchors { left: parent.left; leftMargin: 12; verticalCenter: parent.verticalCenter }
                 size: 16
-                source: "icons/noir-search.svg"
+                source: Theme.icon("search")
                 color: Theme.silverDim
             }
             TextInput {
@@ -208,7 +225,7 @@ FocusScope {
                     anchors.centerIn: appIcon
                     visible: !appIcon.visible
                     size: 18
-                    source: "icons/noir-app.svg"
+                    source: Theme.icon("app")
                 }
                 Column {
                     anchors { left: appIcon.right; leftMargin: 16; right: parent.right; rightMargin: 8; verticalCenter: parent.verticalCenter }
@@ -275,11 +292,12 @@ FocusScope {
             id: powerMenu
             width: 180
             items: [
-                { text: "Lock", icon: "icons/noir-power.svg", action: () => menu.apps.run("loginctl lock-session") },
-                { text: "Log Out", icon: "icons/noir-power.svg", action: () => Qt.quit() },
+                { text: "Lock", icon: Theme.icon("power"), action: () => menu.apps.run("loginctl lock-session") },
+                { text: "Log Out", icon: Theme.icon("power"), action: () => Qt.quit() },
                 { separator: true },
-                { text: "Restart", icon: "icons/noir-power.svg", action: () => menu.apps.run("systemctl reboot") },
-                { text: "Shut Down", icon: "icons/noir-power.svg", action: () => menu.apps.run("systemctl poweroff") },
+                { text: "Suspend", icon: Theme.icon("power"), action: () => menu.apps.run("systemctl suspend") },
+                { text: "Restart", icon: Theme.icon("power"), action: () => menu.apps.run("systemctl reboot") },
+                { text: "Shut Down", icon: Theme.icon("power"), action: () => menu.apps.run("systemctl poweroff") },
             ]
         }
     }

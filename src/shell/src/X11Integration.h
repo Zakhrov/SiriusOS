@@ -37,6 +37,11 @@ public:
     Q_INVOKABLE void setupDock(QWindow *window, Edge edge, int thickness);
     // Popup surfaces (menus, notifications): skip taskbar/pager, keep above.
     Q_INVOKABLE void setupPopup(QWindow *window, bool notification = false);
+    // Frosted glass: asks the compositor to blur what lies behind `rects`
+    // (QRect / Qt.rect values in window coordinates; empty = the whole
+    // window). `enabled` false removes the request. This is KDE's
+    // _KDE_NET_WM_BLUR_BEHIND_REGION, which NoirWM's compositor implements.
+    Q_INVOKABLE void setBlurBehind(QWindow *window, bool enabled, const QVariantList &rects = {});
 
 private:
     void setWindowType(xcb_window_t window, const char *type);

@@ -1,5 +1,7 @@
 #include "AppModel.h"
 
+#include "NoirConfig.h"
+
 #include <QDirIterator>
 #include <QIcon>
 #include <QUrl>
@@ -171,7 +173,7 @@ bool AppModel::launch(int row)
     const App &app = m_apps.at(row);
     QString command = app.exec;
     if (app.terminal)
-        command = QStringLiteral("x-terminal-emulator -e ") + command;
+        command = NoirConfig::instance()->terminal() + QStringLiteral(" -e ") + command;
     const bool ok = run(command);
     if (ok)
         emit launched(app.name);

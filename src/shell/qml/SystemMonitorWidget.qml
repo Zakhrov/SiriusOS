@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Shapes
 import Noir.Shell
+import Noir.Ui
 
 FloatingWidget {
     id: monitor

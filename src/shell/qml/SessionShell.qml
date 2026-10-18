@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Window
 import Noir.Shell
+import Noir.Ui
 
 // Real session: desktop (below everything), taskbar dock with a reserved
 // strut, start menu popup and notification surface, each its own X11 window
@@ -68,8 +69,13 @@ QtObject {
             onActivated: shell.toggleStartMenu()
         }
 
+        // Frosted: the compositor blurs whatever lies behind the bar.
+        readonly property bool frosted: shellComposited && Theme.glassBlur
+        onFrostedChanged: X11Integration.setBlurBehind(this, frosted)
+
         Component.onCompleted: {
             X11Integration.setupDock(this, X11Integration.Bottom, Theme.taskbarHeight)
+            X11Integration.setBlurBehind(this, frosted)
             visible = true
         }
     }
@@ -104,6 +110,22 @@ QtObject {
             onCloseRequested: shell.startMenuOpen = false
         }
 
+        // Frosted behind the menu body (not its shadow margin), once it has
+        // folded out: a blurred rectangle ahead of the fold would give it away.
+        property bool frosted: false
+        property Timer settle: Timer {
+            interval: Theme.durationSlow
+            onTriggered: menuWindow.frosted = shellComposited && Theme.glassBlur && shell.startMenuOpen
+        }
+        property Connections menuWatcher: Connections {
+            target: shell
+            function onStartMenuOpenChanged() {
+                if (shell.startMenuOpen) menuWindow.settle.restart()
+                else menuWindow.frosted = false
+            }
+        }
+        onFrostedChanged: X11Integration.setBlurBehind(this, frosted, [Qt.rect(0, 0, startMenu.width, startMenu.height)])
+
         Component.onCompleted: X11Integration.setupPopup(this, false)
     }
 
@@ -115,7 +137,8 @@ QtObject {
         height: Math.max(1, stack.contentHeight + 24)
         x: shell.screenInfo.virtualX + shell.screenInfo.width - width
         y: shell.panelWindow.y - height
-        visible: NotificationServer.count > 0 || lingering.running
+        // Do not disturb keeps cards off the screen; the taskbar still counts them.
+        visible: !NoirConfig.doNotDisturb && (NotificationServer.count > 0 || lingering.running)
 
         // Keep the surface mapped while the last card animates out.
         property Timer lingering: Timer { interval: Theme.durationNormal + 50 }
@@ -127,6 +150,26 @@ QtObject {
         NotificationStack {
             id: stack
             anchors { right: parent.right; bottom: parent.bottom; bottomMargin: 12 }
+        }
+
+        // Frosted behind each card, not the gaps between them. Cards slide in
+        // and out, so the region follows them while the surface is up.
+        property string blurKey
+        property Timer blurTracker: Timer {
+            interval: 100
+            repeat: true
+            running: shell.notificationWindow.visible && shellComposited && Theme.glassBlur
+            triggeredOnStart: true
+            onTriggered: {
+                const window = shell.notificationWindow
+                const rects = stack.cardRects(window.contentItem)
+                const key = JSON.stringify(rects)
+                if (key === window.blurKey)
+                    return
+                window.blurKey = key
+                X11Integration.setBlurBehind(window, rects.length > 0, rects)
+            }
+            onRunningChanged: if (!running) { shell.notificationWindow.blurKey = ""; X11Integration.setBlurBehind(shell.notificationWindow, false) }
         }
 
         Component.onCompleted: X11Integration.setupPopup(this, true)

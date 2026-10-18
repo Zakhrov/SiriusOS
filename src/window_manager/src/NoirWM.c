@@ -120,8 +120,10 @@ NoirWM* NoirWM_create(int useCompositor) {
     wm->screenHeight = DisplayHeight(wm->display, screen);
 
     // Only one client may select SubstructureRedirect on the root.
+    // StructureNotify reports the root itself changing size (RandR).
     XSetErrorHandler(on_wm_detected);
-    XSelectInput(wm->display, wm->root, SubstructureRedirectMask | SubstructureNotifyMask | PropertyChangeMask);
+    XSelectInput(wm->display, wm->root,
+                 SubstructureRedirectMask | SubstructureNotifyMask | StructureNotifyMask | PropertyChangeMask);
     XSync(wm->display, False);
     if (anotherWmRunning) {
         fprintf(stderr, "Another window manager is already running\n");

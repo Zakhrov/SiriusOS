@@ -1,5 +1,5 @@
 import QtQuick
-import Noir.Shell
+import Noir.Ui
 
 // Glass context menu that drops down with a 3D fold (hinged on its top edge)
 // and staggers its items in. Fully keyboard navigable.

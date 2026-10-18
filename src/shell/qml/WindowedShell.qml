@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Window
 import Noir.Shell
+import Noir.Ui
 
 // Development host: the full shell (desktop, taskbar, start menu and
 // notifications) composed inside one ordinary window.
@@ -40,6 +41,7 @@ Window {
 
         NotificationStack {
             anchors { right: parent.right; bottom: taskbar.top; bottomMargin: 12 }
+            visible: !NoirConfig.doNotDisturb
         }
 
         // Click-away layer while the start menu is open.

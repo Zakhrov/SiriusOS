@@ -1,5 +1,6 @@
 import QtQuick
 import Noir.Shell
+import Noir.Ui
 
 // Bottom taskbar: black glass bar with the start button, running tasks and
 // the system tray. Arrow keys move between items; Tab leaves the bar.
@@ -15,14 +16,19 @@ FocusScope {
 
     height: Theme.taskbarHeight
 
-    // Glass body: darker towards the bottom, silver top edge + inner sheen.
+    // Glass body (opacity from Control Center > Appearance): clearer at the
+    // top, denser towards the bottom, a reflection, silver top edge + sheen.
+    // With a compositor the windows behind show through, frosted.
     Rectangle {
         anchors.fill: parent
         gradient: Gradient {
-            GradientStop { position: 0.0; color: Qt.rgba(0.10, 0.105, 0.12, 0.90) }
-            GradientStop { position: 0.12; color: Qt.rgba(0.04, 0.045, 0.055, 0.92) }
-            GradientStop { position: 1.0; color: Qt.rgba(0.0, 0.0, 0.0, 0.96) }
+            GradientStop { position: 0.0; color: Theme.glassTop }
+            GradientStop { position: 1.0; color: Theme.glassBottom }
         }
+    }
+    GlassReflection {
+        anchors.fill: parent
+        strength: 0.7
     }
     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top } height: 1; color: Theme.glassEdge }
     Rectangle { anchors { left: parent.left; right: parent.right; top: parent.top; topMargin: 1 } height: 1; color: Theme.glassSheen }
@@ -31,7 +37,7 @@ FocusScope {
         id: start
         anchors { left: parent.left; leftMargin: 4; verticalCenter: parent.verticalCenter }
         width: 44; height: 40
-        iconSource: "icons/noir-start.svg"
+        iconSource: Theme.icon("start")
         iconSize: 22
         checked: taskbar.startMenuOpen
         toolTip: "Applications"

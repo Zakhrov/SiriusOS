@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Control Center
+GenericName=System Settings
+Comment=Configure the Noir desktop, displays, sound, network, input devices and more
+Exec=NoirControlCenter
+Icon=preferences-system
+Categories=Settings;System;Qt;
+Keywords=settings;preferences;configuration;display;monitor;sound;network;wifi;bluetooth;keyboard;mouse;touchpad;power;battery;time;graphics;vulkan;
+StartupNotify=true

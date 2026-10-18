@@ -120,25 +120,28 @@ and `--windowed` runs the single-window development shell instead.
 
 ## Rendering under Xvfb
 
-Xvfb has no DRI3, so Mesa's hardware Vulkan drivers cannot present to it.
-NoirShell detects that and falls back to its OpenGL backend, which the
-harness runs on llvmpipe. Pick explicitly with `--backend`:
+The Noir stack renders with Vulkan only. Xvfb has no DRI3, which Mesa's GPU
+drivers normally present through, so the harness sets `MESA_VK_WSI_DEBUG=sw`
+for the session: NoirShell and NoirWM render on the host GPU and Mesa copies
+each finished frame to Xvfb with plain X requests, the way a software driver
+does. `--vulkan` (or `NOIR_XVFB_VULKAN`) picks the device:
 
-| Backend | Under Xvfb |
+| `--vulkan` | Renders on |
 | --- | --- |
-| `auto` (default) | OpenGL on llvmpipe; full fidelity |
-| `opengl` | Same |
-| `software` | Qt Quick's raster renderer; shader effects are skipped, so tinted first-party icons do not draw |
-| `vulkan` | Only works with a software Vulkan driver (lavapipe) installed; otherwise the shell exits and `start` prints the log |
+| `gpu` (default) | The host GPU. Falls back to `cpu` when there is no `/dev/dri/renderD*` |
+| `cpu` | Mesa's software driver (lavapipe), which must be installed (`libvulkan_lvp` on openSUSE, or `VK_DRIVER_FILES` pointing at its ICD manifest) |
+
+`status` shows which device the shell and NoirWM picked, and `noir-xvfb run`
+/ `env` hand the setting on to your own Vulkan clients. Either way frames go
+through the CPU, so the shell keeps its surfaces opaque (Mesa's software
+presentation cannot target ARGB windows); the GPU still takes the rendering
+off the CPU, roughly a third of lavapipe's load for an animating desktop.
 
 By default the harness runs `NoirWM --no-compositor`, so translucent popup
 margins show as black in `shot`; use `grab` to see the surface itself.
 
-`noir-xvfb start --compositor` turns NoirWM's Vulkan compositor on. That
-needs a software Vulkan driver, since hardware ones cannot present to Xvfb:
-install lavapipe (`libvulkan_lvp` on openSUSE), or point `VK_DRIVER_FILES`
-at a copy of its ICD manifest. `shot` then shows the composited result,
-translucency and shadows included.
+`noir-xvfb start --compositor` turns NoirWM's Vulkan compositor on. `shot`
+then shows the composited result, window shadows included.
 
 ## Smoke test
 
@@ -150,7 +153,10 @@ Boots a throwaway `--demo` session in `build/xvfb-smoke/`, checks that the
 desktop and taskbar map, that NoirWM applied the taskbar strut, that a D-Bus
 notification arrives, that a synthesized click on the start button opens the
 start menu, and that a client window gets a frame which `Alt+F10` maximizes
-and `Alt+F4` closes. It saves `shots/smoke.png` and tears everything down,
+and `Alt+F4` closes. It then opens the Control Center on a page, checks
+that starting it again switches the open window's page instead of opening a
+second one, and that a changed setting reaches the running shell. It saves
+`shots/smoke.png` and tears everything down,
 exiting non-zero if any check fails. `noir-xvfb smoke --compositor` runs the
 same checks with compositing on.
 
@@ -163,6 +169,11 @@ tools/xvfb/
 └── CMakeLists.txt   builds noir-xinject, registers the smoke test with CTest
 ```
 
-Runtime state (`display`, `bus.addr`, `*.pid`, `*.log`, `shots/`) lives in
-`build/xvfb/`; override with `NOIR_XVFB_STATE`, and point at another build
-tree with `NOIR_BUILD_DIR`.
+Runtime state (`display`, `bus.addr`, `*.pid`, `*.log`, `shots/`, and
+`config/`, the session's own `XDG_CONFIG_HOME`) lives in `build/xvfb/`. The
+private config directory keeps settings changed in the session (Control
+Center, `mimeapps.list`, `session.conf`) away from your own; the system
+services the Control Center talks to are still the host's. The session's
+`PATH` starts with the build tree, so the shell finds `NoirControlCenter`.
+Override the state directory with `NOIR_XVFB_STATE`, and point at another
+build tree with `NOIR_BUILD_DIR`.

@@ -1,0 +1,34 @@
+#!/bin/sh
+# noir-dev-session: the Noir session (noir-session), run straight from a
+# build tree instead of an installation.
+#
+# Both ways of trying a development build use it, so they run exactly the
+# same thing:
+#   - noir-desktop start      runs it on a nested X server in a window;
+#   - "Noir (development build)" at the login screen, added by
+#     noir-desktop install-session, runs it on bare metal.
+#
+# NOIR_BUILD_DIR picks another build tree (default: <repo>/build).
+set -e
+
+self=$(readlink -f "$0")
+repo=$(cd "$(dirname "$self")/../.." && pwd)
+build=${NOIR_BUILD_DIR:-$repo/build}
+
+for bin in src/window_manager/NoirWM src/shell/NoirShell src/control_center/NoirControlCenter; do
+    if [ ! -x "$build/$bin" ]; then
+        echo "noir-dev-session: $build/$bin is missing; build the tree first" >&2
+        exit 1
+    fi
+done
+
+# The session starts NoirWM, NoirShell and NoirControlCenter by name.
+export PATH="$build/src/control_center:$build/src/shell:$build/src/window_manager:$build/tools/xvfb:$PATH"
+
+# List the Control Center in the start menu as an installation would.
+share="$build/dev-share"
+mkdir -p "$share/applications"
+ln -sf "$repo/src/control_center/org.siriusos.NoirControlCenter.desktop" "$share/applications/"
+export XDG_DATA_DIRS="$share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+exec "$repo/src/session/noir-session" "$@"
